@@ -6,6 +6,19 @@
 
 管理你自己的多个 CodeBuddy 账号登录态，一键把选中账号"切"到 CodeBuddy IDE 使用。
 
+## 下载
+
+**➡️ [点这里下载最新版 CodeBuddyAccountManager.exe](https://github.com/zhuzhuxia-star/codebuddy-account-manager/releases/latest)**
+
+单文件、免安装（Windows 10/11）。用法：
+
+1. 把 `CodeBuddyAccountManager.exe` 放到 `%APPDATA%\CodeBuddyAccountManager\bin\`
+   （目录不存在就新建；**从 `dist` 等其它路径启动在部分机器上会被安全软件拦住**）
+2. 双击运行
+3. 首次使用点「从当前 IDE 导入」或「粘贴导入登录态」把账号加进来
+
+> 全部历史版本见 [Releases](https://github.com/zhuzhuxia-star/codebuddy-account-manager/releases)。
+
 ## 原理
 
 CodeBuddy（VS Code 系）把扩展登录态加密存放在其**用户数据目录**（本机为国内版
