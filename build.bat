@@ -13,8 +13,10 @@ echo ==== 安装依赖 ====
 python -m pip install -r requirements.txt -i https://mirrors.cloud.tencent.com/pypi/simple
 
 echo ==== PyInstaller 打包 ====
+rem version_info.txt 让 exe 属性里带作者（这是哪头猪？）与仓库地址
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name CodeBuddyAccountManager ^
+  --version-file version_info.txt ^
   --distpath dist --workpath build ^
   main.py
 if errorlevel 1 goto :fail

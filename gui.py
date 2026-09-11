@@ -20,6 +20,7 @@ import cb_cloud
 import cb_log
 import cb_runtime
 import cb_task
+import meta
 import wb_api
 import wb_target
 from account_store import AccountStore, parse_pasted_text, quota_columns
@@ -43,7 +44,7 @@ class App:
         self.root = root
         self.store = AccountStore()
         self._busy = False
-        root.title("CodeBuddy 账号管理器")
+        root.title(f"{meta.APP_NAME} v{meta.VERSION} — {meta.AUTHOR}")
         root.geometry("1180x780")
         root.minsize(980, 620)
 
@@ -133,6 +134,9 @@ class App:
                    command=self.cloud_dialog).pack(side=tk.LEFT, padx=(6, 0))
         self.log_btn = ttk.Button(bar3, text="折叠日志", command=self.toggle_log_panel)
         self.log_btn.pack(side=tk.RIGHT)
+        ttk.Button(bar3, text=f"GitHub · {meta.AUTHOR}",
+                   command=lambda: webbrowser.open(meta.GITHUB_URL)
+                   ).pack(side=tk.RIGHT, padx=(0, 6))
 
         # 第四行：自动化开关
         bar4 = ttk.Frame(self.root, padding=(10, 2, 10, 6))
@@ -181,6 +185,11 @@ class App:
         self.ide_label.pack(side=tk.LEFT)
         self.sel_label2 = ttk.Label(bottom, text="")
         self.sel_label2.pack(side=tk.RIGHT)
+        # 作者与仓库地址（点击打开）
+        repo_link = ttk.Label(bottom, text=meta.GITHUB_URL, foreground="#0a66c2",
+                              cursor="hand2")
+        repo_link.pack(side=tk.RIGHT, padx=(0, 16))
+        repo_link.bind("<Button-1>", lambda e: webbrowser.open(meta.GITHUB_URL))
 
     def _build_statusbar(self):
         self.status = ttk.Label(self.root, anchor=tk.W, relief=tk.SUNKEN, padding=(8, 3))

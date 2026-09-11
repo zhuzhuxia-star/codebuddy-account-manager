@@ -1,5 +1,9 @@
 # CodeBuddy 账号管理器（Windows）
 
+> **作者：这是哪头猪？**
+> 仓库：https://github.com/zhuzhuxia-star/codebuddy-account-manager
+> 版本：1.1.0
+
 管理你自己的多个 CodeBuddy 账号登录态，一键把选中账号"切"到 CodeBuddy IDE 使用。
 
 ## 原理

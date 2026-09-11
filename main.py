@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
-"""CodeBuddy 账号管理器入口。用法：
+"""CodeBuddy 账号管理器入口（作者：这是哪头猪？）。
+
+仓库：https://github.com/zhuzhuxia-star/codebuddy-account-manager
+
+用法：
     python main.py              # 启动 GUI
+    python main.py version      # 显示版本与作者信息
     python main.py list         # 列出账号
     python main.py ide-account  # 显示当前 IDE 生效账号
     python main.py checkin-all  # 全部账号：先续期登录态，再签到（计划任务用；--no-refresh 跳过续期）
@@ -43,6 +48,14 @@ def _utf8_console():
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError, io.UnsupportedOperation):
             pass
+
+
+def cmd_version():
+    import meta
+    print(f"{meta.APP_NAME} v{meta.VERSION}")
+    print(f"作者：{meta.AUTHOR}")
+    print(f"仓库：{meta.GITHUB_URL}")
+    return 0
 
 
 def cmd_list():
@@ -250,6 +263,8 @@ def main():
     if len(sys.argv) > 1:
         c = sys.argv[1]
         table = {
+            "version": cmd_version,
+            "about": cmd_version,
             "list": cmd_list,
             "ide-account": cmd_ide_account,
             "checkin-all": cmd_checkin_all,
