@@ -1,0 +1,35 @@
+# ---- 构建产物（体积大且可反编译出源码，不入库）----
+dist/
+build/
+out/
+*.spec
+*.pkg
+*.toc
+*.pyz
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行期数据：**绝对不要提交**（等价于交出自己的账号）----
+*.log
+*.bin
+cloud.json
+accounts.bin
+state.vscdb
+state.vscdb.bak-*
+state.vscdb-wal
+state.vscdb-shm
+*_cloud_post.json
+error.log
+
+# ---- 本地/编辑器 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
