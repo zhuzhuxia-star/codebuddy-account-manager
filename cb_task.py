@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""每日自动签到：把 `checkin-all` 注册成 Windows 计划任务。
+"""自动签到：把 `checkin-all` 注册成 Windows 计划任务。
 
 不引入第三方依赖，直接用系统自带的 `schtasks`（无需管理员权限，当前用户任务）。
+支持两种频率：每天一次（/SC DAILY）或每 N 小时一次（/SC HOURLY /MO N）。
+执行频率保存在 %APPDATA%\\CodeBuddyAccountManager\\schedule.json。
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -13,6 +16,20 @@ from pathlib import Path
 TASK_NAME = "CodeBuddyAccountManagerDailyCheckin"
 STORE_DIR = Path(os.environ.get("APPDATA", "")) / "CodeBuddyAccountManager"
 LOG_FILE = STORE_DIR / "checkin.log"
+SCHEDULE_FILE = STORE_DIR / "schedule.json"
+
+# (间隔小时, 下拉框文案)；0 = 每天一次
+SCHEDULE_PRESETS: tuple[tuple[int, str], ...] = (
+    (0, "每天一次"),
+    (1, "每 1 小时"),
+    (2, "每 2 小时"),
+    (3, "每 3 小时"),
+    (4, "每 4 小时"),
+    (6, "每 6 小时"),
+    (8, "每 8 小时"),
+    (12, "每 12 小时"),
+)
+SCHEDULE_LABELS: tuple[str, ...] = tuple(label for _, label in SCHEDULE_PRESETS)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -37,12 +54,53 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
                           creationflags=subprocess.CREATE_NO_WINDOW)
 
 
-def install(hour: int = 9, minute: int = 5) -> tuple[bool, str]:
-    """注册每日签到任务，返回 (是否成功, 说明)。"""
-    r = _run(["/Create", "/TN", TASK_NAME, "/TR", command_string(),
-              "/SC", "DAILY", "/ST", f"{hour:02d}:{minute:02d}", "/F"])
+def load_schedule() -> tuple[str, int]:
+    """读已保存的执行频率，返回 (HH:MM, 间隔小时)。缺省每天 09:05。"""
+    try:
+        data = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
+        return (str(data.get("time") or "09:05"),
+                int(data.get("interval_hours") or 0))
+    except Exception:  # noqa: BLE001
+        return "09:05", 0
+
+
+def save_schedule(time_str: str, interval_hours: int) -> None:
+    """保存执行频率（时间 HH:MM + 间隔小时，0=每天）。"""
+    try:
+        STORE_DIR.mkdir(parents=True, exist_ok=True)
+        SCHEDULE_FILE.write_text(
+            json.dumps({"time": time_str, "interval_hours": interval_hours},
+                       ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def schedule_label(interval_hours: int) -> str:
+    """间隔小时的中文描述（与下拉框文案一致）。"""
+    for h, label in SCHEDULE_PRESETS:
+        if h == interval_hours:
+            return label
+    return f"每 {interval_hours} 小时"
+
+
+def install(hour: int = 9, minute: int = 5,
+            interval_hours: int = 0) -> tuple[bool, str]:
+    """注册自动签到任务；interval_hours>=1 表示每 N 小时一次，0 表示每天一次。"""
+    start = f"{hour:02d}:{minute:02d}"
+    if interval_hours >= 1:
+        args = ["/Create", "/TN", TASK_NAME, "/TR", command_string(),
+                "/SC", "HOURLY", "/MO", str(interval_hours),
+                "/ST", start, "/F"]
+        desc = (f"已注册自动任务：从 {start} 起每 {interval_hours} 小时执行一次"
+                "\n（先续期登录态 → 签到 → 成长计划，全程幂等）")
+    else:
+        args = ["/Create", "/TN", TASK_NAME, "/TR", command_string(),
+                "/SC", "DAILY", "/ST", start, "/F"]
+        desc = f"已注册每天 {start} 自动任务（先续期 → 签到 → 成长计划）"
+    r = _run(args)
     if r.returncode == 0:
-        return True, f"已注册每日 {hour:02d}:{minute:02d} 自动签到\n{command_string()}"
+        return True, f"{desc}\n{command_string()}"
     return False, (r.stderr or r.stdout or "schtasks 执行失败").strip()[:300]
 
 
@@ -123,7 +181,9 @@ def is_autostart_installed() -> bool:
 def describe() -> str:
     daily = "已开启" if is_installed() else "未开启"
     auto = "已开启" if is_autostart_installed() else "未开启"
-    return f"自动任务（先续期再签到）：开机自启 {auto} / 每日定时 {daily}"
+    _, interval = load_schedule()
+    freq = schedule_label(interval)
+    return f"自动任务（先续期再签到+成长计划）：开机自启 {auto} / 定时[{freq}] {daily}"
 
 
 def append_log(lines: list[str]) -> None:

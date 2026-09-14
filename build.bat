@@ -30,8 +30,9 @@ copy /y "dist\CodeBuddyAccountManager.exe" "%BIN%\CodeBuddyAccountManager.exe"
 if errorlevel 1 goto :fail
 
 echo ==== 注册签到任务（指向部署副本）====
+rem install-task 不带参数 = 沿用上次保存的执行频率（schedule.json，默认每天 09:05）
 "%BIN%\CodeBuddyAccountManager.exe" install-autostart 1
-"%BIN%\CodeBuddyAccountManager.exe" install-task 09:05
+"%BIN%\CodeBuddyAccountManager.exe" install-task
 
 echo.
 echo ==== 完成 ====

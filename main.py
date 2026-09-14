@@ -18,8 +18,8 @@
     python main.py cloud-setpass <同步码> # 在新电脑上设置同步码
     python main.py cloud-push [口令]     # 账号库加密上传（跨电脑保存）
     python main.py cloud-pull [口令] [slug|URL]  # 从云端取回并合并
-    python main.py install-task [HH:MM]  # 注册每日定时签到
-    python main.py uninstall-task        # 取消每日定时签到
+    python main.py install-task [HH:MM] [N]  # 注册定时任务（N=间隔小时，缺省每天；2=每2小时）
+    python main.py uninstall-task            # 取消定时任务
     python main.py install-autostart [延迟分钟]  # 设置开机（登录）后自动签到
     python main.py uninstall-autostart           # 取消开机自启签到
 """
@@ -101,7 +101,33 @@ def cmd_checkin_all():
     tail = f"完成 {ok_n}/{len(results)}"
     print(tail)
     lines.append(tail)
+
+    print("---- 成长计划（接受任务/领奖/兑换/抽奖）----")
+    lines.append("-- 成长计划 --")
+    growth = cb_app.growth_all(store)
+    for label, ok, text in growth:
+        line = f"[{'OK  ' if ok else 'FAIL'}] {label} | {text}"
+        print(line)
+        lines.append(line)
+    g_ok = sum(1 for _, ok, _ in growth if ok)
+    tail = f"完成 {g_ok}/{len(growth)}"
+    print(tail)
+    lines.append(tail)
+    ok_n = min(ok_n, g_ok) if len(growth) else ok_n
     cb_task.append_log(lines)
+    return 0 if ok_n == len(results) else 1
+
+
+def cmd_growth_all():
+    """只跑成长计划（接受任务/领奖/打卡兑换/抽奖），不签到不续期。"""
+    import cb_app
+    from account_store import AccountStore
+
+    results = cb_app.growth_all(AccountStore())
+    for label, ok, text in results:
+        print(f"[{'OK  ' if ok else 'FAIL'}] {label} | {text}")
+    ok_n = sum(1 for _, ok, _ in results if ok)
+    print(f"完成 {ok_n}/{len(results)}")
     return 0 if ok_n == len(results) else 1
 
 
@@ -241,13 +267,22 @@ def cmd_uninstall_autostart():
 
 def cmd_install_task():
     import cb_task
-    arg = sys.argv[2] if len(sys.argv) > 2 else "09:05"
+    args = list(sys.argv[2:])
+    every = 0
+    if args and args[-1].isdigit():  # 末位数字 = 间隔小时（0/缺省 = 每天）
+        every = int(args.pop())
+    arg = args[0] if args else None
+    if arg is None:
+        arg, saved = cb_task.load_schedule()
+        if not every:
+            every = saved
     try:
         hh, mm = (int(x) for x in arg.split(":", 1))
     except ValueError:
         print(f"时间格式应为 HH:MM，收到：{arg}")
         return 2
-    ok, msg = cb_task.install(hh, mm)
+    cb_task.save_schedule(f"{hh:02d}:{mm:02d}", every)
+    ok, msg = cb_task.install(hh, mm, every)
     print(msg)
     return 0 if ok else 1
 
@@ -270,6 +305,7 @@ def main():
             "checkin-all": cmd_checkin_all,
             "refresh-all": cmd_refresh_all,
             "checkin-status": cmd_checkin_status,
+            "growth-all": cmd_growth_all,
             "wb-status": cmd_wb_status,
             "wb-sync": cmd_wb_sync,
             "cloud-status": cmd_cloud_status,

@@ -127,6 +127,8 @@ class App:
         ttk.Button(bar3, text="立即签到", command=self.checkin_selected).pack(side=tk.LEFT)
         ttk.Button(bar3, text="查询签到状态",
                    command=self.checkin_status_selected).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(bar3, text="成长计划",
+                   command=self.growth_selected).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Separator(bar3, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         ttk.Button(bar3, text="同步到 WorkBuddy",
                    command=self.sync_workbuddy).pack(side=tk.LEFT)
@@ -145,6 +147,14 @@ class App:
         self.auto_btn.pack(side=tk.LEFT)
         self.task_btn = ttk.Button(bar4, text="每日定时签到", command=self.toggle_task)
         self.task_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(bar4, text="执行频率：").pack(side=tk.LEFT, padx=(10, 0))
+        self.freq_var = tk.StringVar()
+        self.freq_box = ttk.Combobox(bar4, textvariable=self.freq_var, width=11,
+                                     state="readonly",
+                                     values=list(cb_task.SCHEDULE_LABELS))
+        self.freq_box.pack(side=tk.LEFT, padx=(2, 0))
+        self.freq_box.bind("<<ComboboxSelected>>", self._on_freq_changed)
+        self._load_freq_selection()
         self.cloud_label = ttk.Label(bar4, text="")
         self.cloud_label.pack(side=tk.RIGHT)
         self._update_task_btn()
@@ -540,6 +550,16 @@ class App:
                         lambda a: cb_app.refresh_checkin_status(self.store, a["id"]),
                         "正在查询签到状态", lambda: self.refresh())
 
+    def growth_selected(self):
+        """成长计划：接受任务/领奖/打卡兑换/抽奖（幂等，重复点只处理增量）。"""
+        accounts = self._selected_accounts()
+        if not accounts:
+            return
+        self._batch_run(accounts,
+                        lambda a: cb_app.growth_account(self.store, a["id"]),
+                        "正在执行成长计划（接受任务/领奖/兑换/抽奖）",
+                        lambda: self.refresh())
+
     def sync_workbuddy(self):
         accounts = self._selected_accounts()
         if not accounts:
@@ -552,13 +572,44 @@ class App:
         if cb_task.is_installed():
             ok, msg = cb_task.uninstall()
         else:
-            ok, msg = cb_task.install()
+            # 按下拉框当前选择的频率注册并记住
+            time_str, _ = cb_task.load_schedule()
+            interval = self._selected_interval()
+            cb_task.save_schedule(time_str, interval)
+            hh, mm = (int(x) for x in time_str.split(":", 1))
+            ok, msg = cb_task.install(hh, mm, interval)
         self._update_task_btn()
         if ok:
-            messagebox.showinfo("每日自动签到", msg)
+            messagebox.showinfo("自动签到任务", msg)
         else:
-            messagebox.showerror("每日自动签到", msg)
+            messagebox.showerror("自动签到任务", msg)
         self._set_status(cb_task.describe())
+
+    # ---------- 执行频率 ----------
+    def _load_freq_selection(self):
+        _, interval = cb_task.load_schedule()
+        self.freq_var.set(cb_task.schedule_label(interval))
+
+    def _selected_interval(self) -> int:
+        label = self.freq_var.get()
+        for hours, text in cb_task.SCHEDULE_PRESETS:
+            if text == label:
+                return hours
+        return 0
+
+    def _on_freq_changed(self, _evt=None):
+        """选择频率即保存；若定时任务已开启则立刻按新频率重新注册。"""
+        time_str, _ = cb_task.load_schedule()
+        interval = self._selected_interval()
+        cb_task.save_schedule(time_str, interval)
+        if not cb_task.is_installed():
+            self._set_status(f"执行频率已记住：{cb_task.schedule_label(interval)}"
+                             "（开启定时任务时生效）")
+            return
+        hh, mm = (int(x) for x in time_str.split(":", 1))
+        ok, msg = cb_task.install(hh, mm, interval)
+        self._update_task_btn()
+        self._set_status(("已应用：" if ok else "应用失败：") + msg.split("\n")[0])
 
     def _update_task_btn(self):
         try:
@@ -566,10 +617,12 @@ class App:
             daily = cb_task.is_installed()
         except Exception:
             auto = daily = False
+        freq = cb_task.schedule_label(cb_task.load_schedule()[1])
         self.auto_btn.config(
             text="开机自启（续期+签到）：已开启" if auto else "开机自启（续期+签到）：未开启")
         self.task_btn.config(
-            text="每日定时（续期+签到）：已开启" if daily else "每日定时（续期+签到）：未开启")
+            text=f"定时任务（续期+签到+成长计划·{freq}）："
+                 + ("已开启" if daily else "未开启"))
         try:
             self.cloud_label.config(text=cb_app.cloud_status())
         except Exception:

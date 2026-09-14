@@ -3,8 +3,8 @@
 # 由 build.bat 通过 --version-file version_info.txt 使用
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(1, 2, 0, 0),
+    prodvers=(1, 2, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', '这是哪头猪？'),
             StringStruct('FileDescription', 'CodeBuddy 账号管理器 - 多账号切号/同步/签到工具'),
-            StringStruct('FileVersion', '1.1.0.0'),
+            StringStruct('FileVersion', '1.2.0.0'),
             StringStruct('InternalName', 'CodeBuddyAccountManager'),
             StringStruct('LegalCopyright', 'Copyright (C) 2026 这是哪头猪？'),
             StringStruct('OriginalFilename', 'CodeBuddyAccountManager.exe'),
             StringStruct('ProductName', 'CodeBuddy 账号管理器'),
-            StringStruct('ProductVersion', '1.1.0.0'),
+            StringStruct('ProductVersion', '1.2.0.0'),
             StringStruct(
               'Comments',
               'GitHub: https://github.com/zhuzhuxia-star/codebuddy-account-manager',

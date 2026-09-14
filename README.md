@@ -2,7 +2,7 @@
 
 > **作者：这是哪头猪？**
 > 仓库：https://github.com/zhuzhuxia-star/codebuddy-account-manager
-> 版本：1.1.0
+> 版本：1.2.0
 
 管理你自己的多个 CodeBuddy 账号登录态，一键把选中账号"切"到 CodeBuddy IDE 使用。
 
@@ -86,13 +86,32 @@ CodeBuddy（VS Code 系）把扩展登录态加密存放在其**用户数据目�
    - 状态：`POST /v2/billing/meter/checkin-activity-status`
    - 结果写回账号库，列表「签到」列显示今日是否已领与获得积分；**重复调用是安全的**——
      服务端返回 `10001`（今天已签到）按"今日已签到"处理，不计为失败。
-8. 「每日定时（续期+签到）」：把 `checkin-all` 注册为 Windows 计划任务（默认每天 09:05）。
+8. 「定时任务（续期+签到+成长计划）」：把 `checkin-all` 注册为 Windows 计划任务（**默认每天 09:05**）。
+   右侧「执行频率」下拉框可选 **每 1/2/3/4/6/8/12 小时**：选择即保存，任务已开启时**立即按新频率
+   重新注册**（配置存于 `%APPDATA%\CodeBuddyAccountManager\schedule.json`）。
    **每次运行会先给全部账号续期登录态（refresh token 换新 access token 并写回账号库），
-   再逐个调用每日签到**，续期失败不影响签到（旧 token 有效照样能签）。
-   按钮文字显示当前是否已开启；每次结果追加到
+   再逐个调用每日签到，最后自动执行成长计划（接任务/领奖/派猫/开盲盒/打卡兑换/抽奖）**，
+   续期失败不影响签到（旧 token 有效照样能签）。按钮文字显示当前频率与开启状态；每次结果追加到
    `%APPDATA%\CodeBuddyAccountManager\checkin.log`。
+   > 为什么建议调高频率：任务进度由服务端按真实使用行为**实时**判定，任务完成后要等**下一次运行**
+   > 才会被自动领奖——频率越高，当天完成的任务越早到账（能量越早到手，盲盒越早能开）；派猫到达后
+   > 同样需要下一次运行来领取积分。全部操作幂等，重复执行无副作用。
    想只续期不签到：`python main.py refresh-all`。
-9. 「云端同步…」：把整份账号库**加密后**存到 `https://md.dcio.eu.org/` 的一篇文章里，
+9. 「成长计划」：自动完成 WorkBuddy 成长中心（做任务赢积分）里能自动化的部分，接口与
+   官网用户中心页面一致（实现见 `wb_growth.py`）：
+   - 领取**首只 Buddy**（活动前置任务：同意队长协议 → 领取，得 300 积分 + 8 能量）；
+   - **批量接受任务**（`POST /activity/growth/tasks/accept`，未接受的全部接上）；
+   - **领取已完成任务的奖励**（`claim`，个别任务奖励直接送 Buddy）；
+   - **派猫**（Buddy 旅行）：到达自动领积分并再派下一次（每日有次数上限，
+     旅行 1~4 小时往返，每次得 5~10 积分）；
+   - **开盲盒**：能量攒够 10 的倍数自动开新 Buddy（能量来自任务/首只奖励，
+     每日签到也送）；
+   - **打卡档位兑换**（连续 7/14/28 天达标后自动 `redeem`）与**抽奖**（有次数自动抽完）。
+   全程幂等，重复点击只处理增量。注意：任务进度由服务端按真实使用行为（对话/建画布/
+   用模板等）判定，**工具不伪造行为**——接上的任务要靠正常使用 WorkBuddy 推进进度，
+   第二天再点一次（或等计划任务跑）即可把已完成的奖励领走。
+   只跑成长计划不签到：`python main.py growth-all`。
+10. 「云端同步…」：把整份账号库**加密后**存到 `https://md.dcio.eu.org/` 的一篇文章里，
    实现**跨电脑保存账号**。新电脑装好后点「从云端同步」即可取回全部账号（含登录态）。
    - **不需要自己编口令**：直接点「生成同步码」，工具会生成一串随机码并复制到剪贴板；
      平时本机已记住，只有**换电脑时**需要把它粘到新机器的同一个框里。
@@ -103,9 +122,9 @@ CodeBuddy（VS Code 系）把扩展登录态加密存放在其**用户数据目�
    - 首次点「上传」创建文章（标题固定 `CBAC-VAULT-v1`），之后点「上传」更新同一篇；
      换电脑可先粘贴云端文章 URL/slug 再同步。
    - 本机记住的同步码用 DPAPI 加密存放，仅供无人值守的一键同步使用。
-10. 「开机自启（续期+签到）」：登录后自动执行一次 `checkin-all`（同样**先续期再签到**），
+11. 「开机自启（续期+签到）」：登录后自动执行一次 `checkin-all`（同样**先续期再签到+成长计划**），
     写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，**不需要管理员权限**。
-    与「每日定时（续期+签到）」可同时开启，互为兜底；两者都是幂等的。
+    与「定时任务」可同时开启，互为兜底；两者都是幂等的。
     > 多台电脑同时开自动续期时，若服务端对 refresh token 做一次性轮换，可能出现互相顶号；
     > 实测本服务端可重复使用，风险较低。稳妥做法是只在一台机器开自动续期，再靠云端同步
     > 把最新登录态带到其它机器。
@@ -143,13 +162,14 @@ CodeBuddy（VS Code 系）把扩展登录态加密存放在其**用户数据目�
 | `python main.py checkin-all` | 全部账号：**先续期登录态再签到**（计划任务调用的就是它；`--no-refresh` 可只签到） |
 | `python main.py refresh-all` | 只续期全部账号的登录态 |
 | `python main.py checkin-status` | 只查询签到状态，不领取 |
+| `python main.py growth-all` | 全部账号：自动完成成长计划（领首只 Buddy/接任务/领奖/打卡兑换/抽奖） |
 | `python main.py wb-status` | 显示 WorkBuddy 目标目录与当前账号 |
 | `python main.py wb-sync` | 把当前 IDE 登录态同步到 WorkBuddy |
 | `python main.py cloud-status` | 云端账号库状态（地址、账号数、更新时间） |
 | `python main.py cloud-push [口令]` | 账号库加密上传（口令可省略，用本机记住的） |
 | `python main.py cloud-pull [口令] [slug/URL]` | 从云端取回并合并到本地 |
-| `python main.py install-task 09:05` | 注册/更新每日定时签到 |
-| `python main.py uninstall-task` | 取消每日定时签到 |
+| `python main.py install-task [HH:MM] [N]` | 注册/更新定时任务（N=间隔小时，缺省每天；如 `09:05 2`=每 2 小时） |
+| `python main.py uninstall-task` | 取消定时任务 |
 | `python main.py install-autostart [分钟]` | 设置开机（登录）后自动签到 |
 | `python main.py uninstall-autostart` | 取消开机自启签到 |
 
@@ -183,6 +203,7 @@ build.bat                   # 打包为 dist\CodeBuddyAccountManager.exe
 | `cb_runtime.py` | CodeBuddy 进程检测 / 启动 |
 | `cb_app.py` | 业务流程：从 IDE 导入、切号写回、软件内登录、额度、续期、签到 |
 | `wb_api.py` | WorkBuddy 签到接口：活动状态查询 / 每日签到 + 业务码→状态映射 |
+| `wb_growth.py` | WorkBuddy 成长计划：任务 / 领奖 / 首只 Buddy / 派猫 / 盲盒 / 打卡兑换 / 抽奖 |
 | `wb_target.py` | WorkBuddy 目标定位（target 配置 + 数据目录探测）与登录态同步 |
 | `cb_cloud.py` | 云端保险库：口令派生密钥 + AES-256-GCM 加密，publish/update 到 md.dcio.eu.org |
 | `cb_task.py` | 签到自动化：每日计划任务 + HKCU Run 开机自启 + 签到日志 |
@@ -201,7 +222,7 @@ build.bat                   # 打包为 dist\CodeBuddyAccountManager.exe
 - CodeBuddy 升级若改变加密格式/存储结构，工具可能失效，需相应适配。
 - `state.vscdb` 被 CodeBuddy 占用时 SQLite 可能被锁，因此切号要求先退出 CodeBuddy
   （或勾选自动结束）。
-- 签到接口请只用于**你自己的账号**，且保持低频（每天一次即可）；工具本身做了幂等处理，
+- 签到接口请只用于**你自己的账号**；工具全程幂等，每天一次或每几小时一次都安全，
   重复调用不会重复领取。
 - 计划任务执行的是"当前这份代码"（源码运行用 `pythonw main.py`，打包后用 exe），
   移动项目目录后需重新执行 `install-task` 刷新命令。

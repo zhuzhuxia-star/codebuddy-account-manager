@@ -12,6 +12,7 @@ import cb_log
 import cb_runtime
 import cb_secrets as cs
 import wb_api
+import wb_growth
 import wb_target
 from account_store import (DEFAULT_STORAGE_ID, AccountStore, build_ide_session,
                            quota_columns, summarize_account)
@@ -442,6 +443,83 @@ def refresh_checkin_status(store: AccountStore, account_id: str) -> tuple[bool, 
     text = wb_api.status_text(got.get("data") or {})
     cb_log.log(f"签到状态 | {rec.get('label')} | OK | {text}", "checkin")
     return True, text
+
+
+# ---------- WorkBuddy 成长计划（做任务赢积分） ----------
+def _save_growth(store: AccountStore, rec: dict, res: dict) -> None:
+    """把一次成长计划结果记回账号记录（供列表展示今日状态）。"""
+    claimed = res.get("claimed") or []
+    first = res.get("first") or {}
+    rec["growth"] = {
+        "date": time.strftime("%Y-%m-%d"),
+        "ok": bool(res.get("ok")),
+        "error": (res.get("error") or "")[:160],
+        "credit": (first.get("credit") or 0)
+                  + sum(c.get("credit") or 0 for c in claimed),
+        "claimed_n": len(claimed),
+        "accepted_n": len(res.get("accepted") or []),
+        "redeemed": res.get("redeemed") or [],
+        "drawn_n": len(res.get("drawn") or []),
+        "pending_n": len(res.get("pending") or []),
+        "completed": res.get("completed") or 0,
+        "total": res.get("total") or 0,
+        "energy": res.get("energy") or 0,
+        "travel": res.get("travel") or {},
+        "box": res.get("box") or {},
+        "text": wb_growth.result_text(res),
+        "at": res.get("at") or _now(),
+    }
+    store.update(rec)
+
+
+def growth_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
+    """给单个账号自动完成成长计划（接受任务/领奖/兑换/抽奖）。
+
+    幂等：重复执行只处理增量；token 失效会先自动续期再试一次。
+    """
+    rec = store.get(account_id)
+    if not rec:
+        return False, "账号不存在"
+    auth = record_auth(rec)
+    if not auth:
+        return False, "该账号没有可用的 access token"
+
+    res = wb_growth.run(auth)
+    if not res.get("ok") and auth.get("refreshToken") and _is_auth_error(res):
+        try:
+            new_auth = cb_api.refresh_auth(auth)
+        except Exception:
+            pass
+        else:
+            try:
+                _rebuild_keys_with_auth(rec, new_auth)
+            except Exception:
+                pass
+            res = wb_growth.run(new_auth)
+
+    ok = bool(res.get("ok"))
+    _save_growth(store, rec, res)
+    text = wb_growth.result_text(res)
+    cb_log.log(f"成长计划 | {rec.get('label')} | {'OK' if ok else 'FAIL'} | {text}",
+               "growth")
+    return ok, text
+
+
+def _is_auth_error(res: dict) -> bool:
+    err = str(res.get("error") or "")
+    return "HTTP 401" in err or "HTTP 403" in err
+
+
+def growth_all(store: AccountStore) -> list[tuple[str, bool, str]]:
+    """给账号库中全部账号跑成长计划，返回 [(账号名, 是否成功, 明细)]。"""
+    out = []
+    for rec in store.list_accounts():
+        try:
+            ok, text = growth_account(store, rec["id"])
+        except Exception as e:  # noqa: BLE001
+            ok, text = False, str(e)
+        out.append((rec.get("label") or rec.get("uid") or "?", ok, text))
+    return out
 
 
 def current_ide_account() -> str | None:

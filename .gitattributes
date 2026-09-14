@@ -1,0 +1,4 @@
+# 仓库内存 LF，检出时按平台转换：避免网页端编辑产生"整文件行尾差异"
+* text=auto
+*.bat text eol=crlf
+*.exe binary
