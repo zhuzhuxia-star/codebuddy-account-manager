@@ -71,7 +71,8 @@ def import_from_ide(store: AccountStore, db: Path | None = None) -> dict:
 
 
 def switch_to_account(account: dict, force_kill: bool = False,
-                      sync_workbuddy: bool = True) -> SwitchResult:
+                      sync_workbuddy: bool = True,
+                      store: AccountStore | None = None) -> SwitchResult:
     """切号：备份 DB -> 用目标账号明文加密写回 -> 同步到 WorkBuddy。返回结果。"""
     keys = account.get("keys") or {}
     if not keys:
@@ -119,20 +120,36 @@ def switch_to_account(account: dict, force_kill: bool = False,
         msg += f"\n原登录态已备份：{Path(bak).name}"
     msg += f"\n校验：{'通过，IDE 下次启动即为该账号' if verified else '未通过，当前读到的是 ' + (actual or '空')}"
 
-    # 同步到 WorkBuddy（同一套 DPAPI + AES-GCM，写入 target 声明的数据目录）
+    # 同步到 WorkBuddy（写它自己的 auth/<id>.info；见 wb_target 头部说明）
     if sync_workbuddy and plains:
-        ok, wb_msg = wb_target.sync_session(plains[0])
+        ok, wb_msg, new_auth = wb_target.sync_session(plains[0], extra_account=account)
         msg += f"\nWorkBuddy 同步：{'成功 — ' if ok else '跳过 — '}{wb_msg}"
         cb_log.log(f"WorkBuddy 同步 | {'OK' if ok else 'SKIP'} | {wb_msg}", "switch")
+        if ok and new_auth:
+            _persist_refreshed(store, account, new_auth)
     cb_log.log(f"切号 | {account.get('label')} | 写入 {n} 条 | 校验="
                f"{'通过' if verified else '未通过'}", "switch")
     return SwitchResult(True, msg, str(bak) if bak else None)
 
 
-def sync_to_workbuddy(account: dict) -> tuple[bool, str]:
-    """把某个账号的登录态单独同步到 WorkBuddy。"""
-    if cb_runtime.is_running() or cb_runtime.is_workbuddy_running():
-        return False, "请先退出 CodeBuddy / WorkBuddy 再同步（state.vscdb 被占用时无法写入）"
+def _persist_refreshed(store: AccountStore | None, rec: dict, new_auth: dict) -> None:
+    """把续期得到的新 token 写回账号记录（切号 / 同步 WorkBuddy 时会顺手续期）。"""
+    try:
+        _rebuild_keys_with_auth(rec, new_auth)
+        rec["refreshed_at"] = _now()
+        if store is not None and rec.get("id"):
+            store.update(rec)
+    except Exception as e:  # noqa: BLE001
+        cb_log.log(f"保存续期态失败 | {rec.get('label')} | {e}", "switch")
+
+
+def sync_to_workbuddy(account: dict,
+                      store: AccountStore | None = None) -> tuple[bool, str]:
+    """把某个账号的登录态单独同步到 WorkBuddy（写 auth/workbuddy-desktop.info）。
+
+    只读写 WorkBuddy 自己的认证文件，不动 IDE 的 state.vscdb，因此 WorkBuddy 开着也能同步
+    （它带文件监听，多数情况会自动重载；没生效就重启一次）。
+    """
     plains = list((account.get("keys") or {}).values())
     if not plains:
         return False, "该账号没有可用的登录数据"
@@ -141,7 +158,11 @@ def sync_to_workbuddy(account: dict) -> tuple[bool, str]:
         ref_id = cs.get_current_storage_id()
     except Exception:
         pass
-    return wb_target.sync_session(_normalize_plain(plains[0], ref_id))
+    ok, msg, new_auth = wb_target.sync_session(_normalize_plain(plains[0], ref_id),
+                                               extra_account=account)
+    if ok and new_auth:
+        _persist_refreshed(store, account, new_auth)
+    return ok, msg
 
 
 def verify_current(uid: str) -> tuple[bool, str]:

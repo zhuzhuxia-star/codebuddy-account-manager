@@ -172,7 +172,7 @@ def cmd_wb_sync():
     except Exception as e:  # noqa: BLE001
         print(f"读取当前 IDE 登录态失败：{e}")
         return 1
-    ok, msg = cb_app.sync_to_workbuddy(acct)
+    ok, msg = cb_app.sync_to_workbuddy(acct, store)
     print(f"[{'OK  ' if ok else 'FAIL'}] {acct.get('label')} | {msg}")
     return 0 if ok else 1
 

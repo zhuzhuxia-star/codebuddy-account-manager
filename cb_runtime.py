@@ -56,17 +56,22 @@ def find_codebuddy_exe() -> Path | None:
     return None
 
 
+def _tasklist_lines(name: str) -> str:
+    """跑一次 tasklist；强制 utf-8 + replace 解码，避免中文表头在 UTF-8 模式下炸掉。"""
+    r = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    return r.stdout or ""
+
+
 def _running_names(names=PROC_NAMES) -> list[str]:
     running = []
     for name in names:
         try:
-            r = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"],
-                capture_output=True, text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            if name in r.stdout:
+            if name in _tasklist_lines(name):
                 running.append(name)
-        except OSError:
+        except (OSError, TypeError):
             continue
     return running
 

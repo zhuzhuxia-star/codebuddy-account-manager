@@ -2,7 +2,7 @@
 
 > **作者：这是哪头猪？**
 > 仓库：https://github.com/zhuzhuxia-star/codebuddy-account-manager
-> 版本：1.2.0
+> 版本：1.2.1
 
 管理你自己的多个 CodeBuddy 账号登录态，一键把选中账号"切"到 CodeBuddy IDE 使用。
 
@@ -73,13 +73,19 @@ CodeBuddy（VS Code 系）把扩展登录态加密存放在其**用户数据目�
    - 额度格式：`剩余/总量（已用 x）· 日期`；免费/试用账号显示**额度周期刷新日**，
      专业订阅显示扣费到期日。token 失效时自动用 refresh token 续期后重试。
 5. 「续期登录态」：用 refresh token 换取新的 access token 并更新账号库（避免过期）。
-6. 「同步到 WorkBuddy」：把选中账号的登录态写入 WorkBuddy 使用的登录库。
-   - WorkBuddy 是 CodeBuddy 的**伴侣壳**（见 `%APPDATA%\WorkDaddy\workbuddy-target.json`
-     的 `binary` / `dataRoot`）：它不单独存一份账号，而是复用其拉起的 CodeBuddy 实例的
-     登录态，所以同步用的仍是同一套 DPAPI + AES-256-GCM 算法。
-   - 目标目录按 `dataRoot` → `%APPDATA%\WorkDaddy` → `%APPDATA%\CodeBuddy CN` 顺序自动
-     探测，底栏会显示实际写入的目录；「切换到选中账号」时默认会一并同步。
-   - 同步前请先退出 CodeBuddy / WorkBuddy（`state.vscdb` 被占用时无法写入）。
+6. 「同步到 WorkBuddy」：把选中账号写进 WorkBuddy **自己的**登录态文件。
+   - 新版 WorkBuddy（桌面版 5.x）把会话存成明文 JSON：
+     `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
+     （`{account, auth, accounts, allAccounts}`；客户端把 `auth.domain` 当 `X-Domain` 头）。
+     旧版 WorkBuddy IDE 才读 `%APPDATA%\WorkBuddy\User\globalStorage\state.vscdb`，
+     工具仍兼容：探测不到 `.info` 时自动回退旧路径。
+   - ⚠️ `%APPDATA%\WorkDaddy\workbuddy-target.json` 里的 `binary` / `dataRoot` 描述的是
+     启动器要拉起的 CodeBuddy 实例，**不是** WorkBuddy 的登录态——早期版本据此写
+     `state.vscdb`，于是出现"切号对 WorkBuddy 没效果"（已修）。
+   - 写入前会先用该账号的 refresh token 续期（账号库里那把旧 access token 在开放网关上是
+     401；实测续期后的 token 在签到 / 成长计划 / 账号接口全部 200），原文件备份到
+     `%APPDATA%\CodeBuddyAccountManager\wb_backup\`；「切换到选中账号」时默认会一并同步。
+   - WorkBuddy 开着也能同步（它监听这个文件，多数情况会自动重载；没生效就重启一次它）。
 7. 「立即签到」/「查询签到状态」：调用 WorkBuddy 的每日积分签到接口（与客户端一致，
    走 CodeBuddy 同一网关）：
    - 签到：`POST /v2/billing/meter/daily-checkin`
@@ -204,7 +210,7 @@ build.bat                   # 打包为 dist\CodeBuddyAccountManager.exe
 | `cb_app.py` | 业务流程：从 IDE 导入、切号写回、软件内登录、额度、续期、签到 |
 | `wb_api.py` | WorkBuddy 签到接口：活动状态查询 / 每日签到 + 业务码→状态映射 |
 | `wb_growth.py` | WorkBuddy 成长计划：任务 / 领奖 / 首只 Buddy / 派猫 / 盲盒 / 打卡兑换 / 抽奖 |
-| `wb_target.py` | WorkBuddy 目标定位（target 配置 + 数据目录探测）与登录态同步 |
+| `wb_target.py` | WorkBuddy 登录态同步（新版 `auth/*.info` 优先，旧版 state.vscdb 兼容） |
 | `cb_cloud.py` | 云端保险库：口令派生密钥 + AES-256-GCM 加密，publish/update 到 md.dcio.eu.org |
 | `cb_task.py` | 签到自动化：每日计划任务 + HKCU Run 开机自启 + 签到日志 |
 | `cb_log.py` | 统一日志（接口请求/批量任务/签到，落盘 + 界面可查） |

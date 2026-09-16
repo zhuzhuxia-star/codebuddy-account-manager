@@ -565,7 +565,7 @@ class App:
         if not accounts:
             return
         self._set_status(wb_target.status_line())
-        self._batch_run(accounts, lambda a: cb_app.sync_to_workbuddy(a),
+        self._batch_run(accounts, lambda a: cb_app.sync_to_workbuddy(a, self.store),
                         "正在同步到 WorkBuddy", lambda: self.refresh())
 
     def toggle_task(self):
@@ -844,14 +844,14 @@ class App:
         force = self.run_var.get()
         hint = ("即将把 CodeBuddy IDE 登录态切换为：\n\n"
                 f"    {a.get('label')}\n\n"
-                "切换前会先备份当前登录态；完成后会把同一份登录态同步到 WorkBuddy"
-                "（若 WorkBuddy 数据目录可用）。")
+                "切换前会先备份当前登录态；完成后会把该账号同步到 WorkBuddy"
+                "（写它的 auth/workbuddy-desktop.info，WorkBuddy 在运行也没关系）。")
         if force:
             hint += "\n\n勾选了自动重启：将强制结束 CodeBuddy（未保存内容会丢失），写库后自动重新打开。"
         if not messagebox.askyesno("确认切换", hint):
             return
 
-        res = cb_app.switch_to_account(a, force_kill=force)
+        res = cb_app.switch_to_account(a, force_kill=force, store=self.store)
         if not res.ok:
             messagebox.showerror("切号失败", res.message)
             return
