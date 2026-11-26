@@ -51,6 +51,16 @@ DATA_DIR = Path(os.environ["APPDATA"]) / "CodeBuddyAccountManager"
 WEB_CONF = DATA_DIR / "web.json"
 PORT = int(os.environ.get("CBW_PORT", "8080"))
 
+# 站点图标：文件放在服务自身目录的 static/ 下（随部署同步），路径 -> (文件名, 类型)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+FAVICONS = {
+    "/favicon.ico": ("favicon.ico", "image/x-icon"),
+    "/favicon-16.png": ("favicon-16.png", "image/png"),
+    "/favicon-32.png": ("favicon-32.png", "image/png"),
+    "/favicon-180.png": ("favicon-180.png", "image/png"),
+    "/favicon-512.png": ("favicon-512.png", "image/png"),
+}
+
 DEFAULT_CONF = {
     "pw_salt": "",
     "pw_hash": "",
@@ -423,6 +433,9 @@ def page(title: str, body: str, msg: str = "", is_err: bool = False) -> bytes:
     m = f'<div class="msg{" err" if is_err else ""}">{esc(msg)}</div>' if msg else ""
     doc = (f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+           f"<link rel='icon' href='/favicon.ico' sizes='any'>"
+           f"<link rel='icon' type='image/png' sizes='32x32' href='/favicon-32.png'>"
+           f"<link rel='apple-touch-icon' href='/favicon-180.png'>"
            f"<title>{esc(title)}</title><style>{CSS}</style></head>"
            f"<body><div class='wrap'>{m}{body}</div></body></html>")
     return doc.encode("utf-8")
@@ -1370,6 +1383,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_favicon(self, path: str, head_only: bool = False):
+        """站点图标（公开，不需登录）：从服务自身目录的 static/ 读文件。"""
+        name, ctype = FAVICONS[path]
+        try:
+            data = (STATIC_DIR / name).read_bytes()
+        except OSError:
+            return self._send(404, b"", "text/plain; charset=utf-8")
+        if head_only:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=604800")
+            self.end_headers()
+            return
+        return self._send(200, data, ctype,
+                          {"Cache-Control": "public, max-age=604800"})
+
     def _redirect(self, to: str, msg: str = "", is_err: bool = False,
                   cookie: str | None = None):
         if msg:
@@ -1485,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         """短链的 HEAD 探测（播放器开播前常先发）：只回头、不回体。"""
         u = urllib.parse.urlparse(self.path)
+        if u.path in FAVICONS:
+            return self._serve_favicon(u.path, head_only=True)
         if u.path.startswith("/oos/s/"):
             key = oos_short_target(u.path[len("/oos/s/"):].strip())
             cli = u3_client() if key else None
@@ -1515,6 +1547,8 @@ class Handler(BaseHTTPRequestHandler):
         msg, is_err = q.get("msg", ""), q.get("err") == "1"
         conf = load_conf()
 
+        if u.path in FAVICONS:
+            return self._serve_favicon(u.path)
         if u.path == "/setup":
             if conf.get("pw_hash"):
                 return self._redirect("/login")
