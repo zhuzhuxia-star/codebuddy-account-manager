@@ -33,6 +33,7 @@ os.environ.setdefault("APPDATA", os.environ.get("CBW_DATA", str(Path.home() / ".
 
 import cb_app  # noqa: E402
 import cb_cloud  # noqa: E402
+import cb_ledger  # noqa: E402
 import cb_log  # noqa: E402
 
 try:
@@ -174,19 +175,23 @@ def job_quota_all() -> dict:
 
 
 def job_full() -> dict:
-    """与桌面版 checkin-all 一致并加强：续期 → 刷新额度 → 签到 → 成长计划。"""
+    """与桌面版 checkin-all 一致并加强：续期 → 刷新额度 → 签到 →
+    活跃上报 → 积分补偿/礼包 → 成长计划（含连登兑换/抽奖）。"""
     store = AccountStore()
     out = []
     out += _fmt_results("续期登录态", cb_app.refresh_all_sessions(store))["lines"]
     out += _fmt_results("额度刷新", _quota_results(store))["lines"]
     out += _fmt_results("每日签到", cb_app.checkin_all(store))["lines"]
+    out += _fmt_results("活跃上报", cb_app.activity_all(store))["lines"]
+    out += _fmt_results("积分补偿/礼包", cb_app.compensation_all(store))["lines"]
     out += _fmt_results("成长计划", cb_app.growth_all(store))["lines"]
-    return {"title": "续期 + 额度 + 签到 + 成长计划",
+    return {"title": "续期 + 额度 + 签到 + 活跃 + 补偿 + 成长计划",
             "at": time.strftime("%Y-%m-%d %H:%M:%S"), "lines": out}
 
 
 def job_growth() -> dict:
-    return _fmt_results("成长计划", cb_app.growth_all(AccountStore()))
+    # 每 2 小时的定时轮：跳过连登兑换/抽奖（放每日全量，避免超频）
+    return _fmt_results("成长计划", cb_app.growth_all(AccountStore(), daily=False))
 
 
 def job_status() -> dict:
@@ -211,6 +216,9 @@ def job_single(kind: str, account_id: str) -> dict:
     if kind == "quota":
         ok, text = cb_app.refresh_quota(store, account_id)
         return _fmt_results("单账号额度", [(label, ok, text)])
+    if kind == "liveness":
+        ok, text = cb_app.liveness_account(store, account_id)
+        return _fmt_results("单账号测活", [(label, ok, text)])
     raise ValueError(kind)
 
 
@@ -544,6 +552,22 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             ck_text = "今日未签"
         gr = rec.get("growth") or {}
         gr_text = gr.get("text") if gr.get("date") == today else "-"
+        lv = rec.get("liveness") or {}
+        if lv:
+            lv_at = str(lv.get("at") or "")
+            lv_text = f"{lv_at[5:16]} {lv.get('text') or ''}"
+            if lv.get("status") == "auth_dead":
+                lv_html = (f"<span style='color:#b91c1c;font-weight:600'>"
+                           f"测活：{esc(lv_text)}</span>")
+            elif lv.get("status") == "error":
+                lv_html = f"<span style='color:#b45309'>测活：{esc(lv_text)}</span>"
+            else:
+                lv_html = f"<span>测活：{esc(lv_text)}</span>"
+        else:
+            lv_html = "<span>测活：未测</span>"
+        dead_badge = ("<span class='apill' style='background:#fef2f2;color:#b91c1c'>"
+                      "需重新登录</span>"
+                      if lv.get("status") == "auth_dead" else "")
         rid = esc(rec.get("id") or "")
         phone = _full_phone(rec)
         label = str(rec.get('label') or rec.get('uid') or '?')
@@ -571,10 +595,11 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             f"<div class='acard'>"
             f"<div class='ahead'><div><div class='aname'>{esc(disp)}</div>"
             f"<div class='small'>{sub}</div></div>"
-            f"<span class='apill'>{esc(plan)}</span></div>"
+            f"<span>{dead_badge}<span class='apill'>{esc(plan)}</span></span></div>"
             f"<div class='abig'>{big}{cnt_html}{upd_html}</div>"
             f"<div class='ameta'><span>签到：{esc(ck_text)}</span>"
             f"<span>成长计划：{esc(gr_text or '-')}</span>"
+            f"{lv_html}"
             f"<span>上次续期：{esc(rec.get('refreshed_at') or '-')}</span></div>"
             f"<div class='pkhead'><span>近期到期</span>{more_html}</div>"
             f"{pkg_html}"
@@ -585,6 +610,8 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             f"<input type='hidden' name='id' value='{rid}'><button class='gray'>续期</button></form>"
             f"<form method='post' action='/run/quota'>"
             f"<input type='hidden' name='id' value='{rid}'><button class='gray'>额度</button></form>"
+            f"<form method='post' action='/run/liveness'>"
+            f"<input type='hidden' name='id' value='{rid}'><button class='gray'>测活</button></form>"
             f"<a class='btn gray' href='/script?id={rid}'>登录脚本</a>"
             f"<form method='post' action='/account/delete' "
             f"onsubmit='return confirm(\"确定删除这个账号？\")'>"
@@ -600,11 +627,12 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
     body = f"""<h1>CodeBuddy 账号管理器 · 网页版</h1>
 <div id="jobbar"></div>
 <div class="row">
-<form class="inline" method="post" action="/run/full"><button>立即执行：续期+额度+签到+成长计划</button></form>
+<form class="inline" method="post" action="/run/full"><button>立即执行：续期+额度+签到+活跃+补偿+成长计划</button></form>
 <form class="inline" method="post" action="/run/quota-all"><button class="gray">刷新全部额度</button></form>
 <form class="inline" method="post" action="/run/status"><button class="gray">只查签到状态</button></form>
 <form class="inline" method="post" action="/run/growth"><button class="gray">只跑成长计划</button></form>
 <a class="btn gray" href="/import">导入账号</a>
+<a class="btn gray" href="/ledger">积分获取</a>
 <a class="btn gray" href="/settings">设置</a>
 <a class="btn gray" href="/logs">日志</a>
 <a class="btn gray" href="/oos">对象存储</a>
@@ -696,6 +724,82 @@ def logs_page() -> bytes:
     body = ("<h1>运行日志</h1><pre>" + esc("\n".join(lines)) +
             "</pre><p><a class='btn gray' href='/'>返回账号列表</a></p>")
     return page("运行日志", body)
+
+
+def ledger_page(account: str = "", source: str = "") -> bytes:
+    """积分获取记账页：逐笔流水（时间倒序），可按账号/来源筛选，
+    顶部给今日/累计汇总与按账号小计。历史无法回填，自上线起记录。"""
+    s = cb_ledger.summary()
+    entries = cb_ledger.list_entries(uid=account, source=source, limit=300)
+
+    store = AccountStore()
+    acc_opts = ["<option value=''>全部账号</option>"]
+    seen = set()
+    for rec in store.list_accounts():
+        uid = rec.get("uid") or ""
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        sel = " selected" if uid == account else ""
+        acc_opts.append(f"<option value='{esc(uid)}'{sel}>"
+                        f"{esc(rec.get('label') or uid)}</option>")
+    for a in cb_ledger.accounts_in_entries():
+        if a["uid"] and a["uid"] not in seen:
+            seen.add(a["uid"])
+            sel = " selected" if a["uid"] == account else ""
+            acc_opts.append(f"<option value='{esc(a['uid'])}'{sel}>"
+                            f"{esc(a['label'] or a['uid'])}</option>")
+    src_opts = ["<option value=''>全部来源</option>"]
+    for k, v in cb_ledger.SOURCES.items():
+        sel = " selected" if k == source else ""
+        src_opts.append(f"<option value='{k}'{sel}>{v}</option>")
+
+    def _sum_txt(credit, unknown, count) -> str:
+        t = f"+{_fmt_credits(credit)} 积分 · {count} 笔"
+        if unknown:
+            t += f"（另 {unknown} 笔数量未知）"
+        return t
+
+    per_acc = []
+    for uid, pa in sorted(s["per_account"].items(),
+                          key=lambda kv: -kv[1]["credit"]):
+        name = pa["label"] or uid or "?"
+        if pa["phone_tail"]:
+            name += f"（尾号 {pa['phone_tail']}）"
+        per_acc.append(f"<tr><td>{esc(name)}</td>"
+                       f"<td>{_sum_txt(pa['credit'], pa['unknown'], pa['count'])}</td></tr>")
+
+    rows = []
+    for e in entries:
+        credit = e.get("credit")
+        c_txt = (f"+{_fmt_credits(credit)}" if isinstance(credit, (int, float))
+                 else "数量未知")
+        name = e.get("label") or e.get("uid") or "?"
+        if e.get("phone_tail"):
+            name += f"（尾号 {e['phone_tail']}）"
+        note = e.get("note") or ""
+        detail = e.get("detail") or ""
+        rows.append(
+            f"<tr><td style='white-space:nowrap'>{esc(e.get('ts') or '')}</td>"
+            f"<td>{esc(name)}</td>"
+            f"<td>{esc(cb_ledger.SOURCES.get(e.get('source') or '', e.get('source') or ''))}</td>"
+            f"<td>{esc(detail)}</td><td>{esc(c_txt)}</td>"
+            f"<td class='small'>{esc(note)}</td></tr>")
+
+    body = f"""<h1>积分获取</h1>
+<p><a class="btn gray" href="/">返回账号列表</a></p>
+<div class="card"><b>今日</b> {_sum_txt(s['today_credit'], s['today_unknown'], s['today_count'])}
+ · <b>累计</b> {_sum_txt(s['total_credit'], s['total_unknown'], s['total_count'])}
+<span class="small">（自记账功能上线起记录，历史进账无法回填；数量未知的笔数不计入金额）</span></div>
+{('<div class="card"><h2>按账号小计（累计）</h2><table>' + ''.join(per_acc) + '</table></div>') if per_acc else ''}
+<div class="card"><form method="get" action="/ledger" class="row">
+<label>账号 <select name="account" style="width:auto">{''.join(acc_opts)}</select></label>
+<label>来源 <select name="source" style="width:auto">{''.join(src_opts)}</select></label>
+<button type="submit">筛选</button></form>
+<table><tr><th>时间</th><th>账号</th><th>来源</th><th>明细</th><th>积分</th><th>备注</th></tr>
+{''.join(rows) if rows else '<tr><td colspan="6">暂无记录（签到、成长任务等产生进账后会出现在这里）</td></tr>'}
+</table></div>"""
+    return page("积分获取", body)
 
 
 # ---------- 一键登录脚本（写入任意 Windows 电脑的 WorkBuddy / CodeBuddy） ----------
@@ -1347,6 +1451,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, settings_page(msg, is_err))
         if u.path == "/logs":
             return self._send(200, logs_page())
+        if u.path == "/ledger":
+            return self._send(200, ledger_page(q.get("account", ""),
+                                               q.get("source", "")))
         if u.path == "/oos":
             return self._send(200, oos_page(msg, is_err))
         if u.path == "/oos/get":
@@ -1433,8 +1540,8 @@ class Handler(BaseHTTPRequestHandler):
             _sessions.pop(self._cookie_token() or "", None)
             return self._redirect("/login", cookie="cbw_session=; Path=/; Max-Age=0")
         if u.path == "/run/full":
-            run_job_async("手动：续期+额度+签到+成长计划", job_full)
-            return self._redirect("/", "已开始执行（续期+额度+签到+成长计划），稍等片刻刷新页面看结果")
+            run_job_async("手动：续期+额度+签到+活跃+补偿+成长计划", job_full)
+            return self._redirect("/", "已开始执行（续期+额度+签到+活跃+补偿+成长计划），稍等片刻刷新页面看结果")
         if u.path == "/run/quota-all":
             run_job_async("手动：刷新全部额度", job_quota_all)
             return self._redirect("/", "已开始刷新全部账号额度，稍等片刻刷新页面看结果")
@@ -1442,12 +1549,14 @@ class Handler(BaseHTTPRequestHandler):
             key = start_online_login()
             return self._redirect(f"/login-online?k={key}")
         if u.path == "/run/growth":
-            run_job_async("手动：成长计划", job_growth)
+            run_job_async("手动：成长计划",
+                          lambda: _fmt_results(
+                              "成长计划", cb_app.growth_all(AccountStore())))
             return self._redirect("/", "已开始执行成长计划，稍等片刻刷新页面看结果")
         if u.path == "/run/status":
             run_job_async("手动：签到状态查询", job_status)
             return self._redirect("/", "已开始查询签到状态，稍等片刻刷新页面看结果")
-        if u.path in ("/run/checkin", "/run/refresh", "/run/quota"):
+        if u.path in ("/run/checkin", "/run/refresh", "/run/quota", "/run/liveness"):
             kind = u.path.rsplit("/", 1)[1]
             aid = form.get("id", "")
             run_job_async(f"手动：单账号{kind}", lambda: job_single(kind, aid))

@@ -30,3 +30,5 @@ cb_app / account_store / cb_cloud）原样复用，只替换 Windows 专属层�
 
 ⚠️ 网页版成为签到/续期的唯一执行者后，建议关掉桌面版的计划任务与开机自启，
 避免两边同时用 refresh token 续期互相顶号（桌面版 README 的稳妥做法）。
+
+致谢：活跃上报、官网网页会话、积分补偿等接口的协议形状参考了 workbuddy2api-panel 的协议分析（AGPL-3.0）：https://github.com/yreidev/workbuddy2api-panel ，本项目为独立 Python 实现，未复制其代码。

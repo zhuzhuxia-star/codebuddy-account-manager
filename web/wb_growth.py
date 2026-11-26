@@ -222,7 +222,9 @@ def run(auth: dict, *, accept: bool = True, claim: bool = True,
         "accepted": [],           # 本次新接受的任务 code
         "claimed": [],            # [{code, credit, energy}]
         "redeemed": [],           # [tier]
-        "drawn": [],              # 抽奖奖品列表
+        "redeem_credits": {},     # {tier: credit} 兑换积分（取连登档位表，响应本身不带）
+        "drawn": [],              # 抽奖奖品名列表
+        "drawn_detail": [],       # [{name, credit}] credit 未知为 None
         "pending": [],            # 已接受但未完成（需真实行为）的 code
         "locked": [],             # 未解锁的任务 code
         "energy": 0, "lottery_chances": 0,
@@ -289,13 +291,22 @@ def run(auth: dict, *, accept: bool = True, claim: bool = True,
 
         # 4) 打卡档位兑换（available 才兑，从奖励高的档位开始）
         if redeem:
-            redemption = (_call("GET", STREAK_PATH, auth) or {}).get(
-                "redemption_status") or {}
+            streak_data = _call("GET", STREAK_PATH, auth) or {}
+            redemption = streak_data.get("redemption_status") or {}
+            # 兑换响应本身不带积分数，记账用档位表里列出的 credit
+            tier_credit = {}
+            for t in (redemption.get("tiers") or []):
+                if isinstance(t, dict) and t.get("tier"):
+                    c = t.get("credit")
+                    tier_credit[t["tier"]] = (int(c) if isinstance(c, (int, float))
+                                              and not isinstance(c, bool) else None)
             for tier in REDEEM_TIERS:
                 if redemption.get(f"tier_{tier}_status") == "available":
                     _call("POST", REDEEM_PATH, auth,
-                          {"tier": tier, "client_token": str(uuid.uuid4())})
+                          {"tier": tier,
+                           "client_token": f"redeem-{tier}-{uuid.uuid4()}"})
                     res["redeemed"].append(tier)
+                    res["redeem_credits"][tier] = tier_credit.get(tier)
 
         # 5) 抽奖（有次数就抽完）
         if draw:
@@ -305,11 +316,20 @@ def run(auth: dict, *, accept: bool = True, claim: bool = True,
                 if not balance:
                     break
                 data = _call("POST", LOTTERY_DRAW_PATH, auth,
-                             {"client_token": str(uuid.uuid4())})
+                             {"client_token": f"draw-{uuid.uuid4()}"})
                 prize = (data.get("prize") or data.get("reward") or data or {})
                 name = (prize.get("name") or prize.get("prize_name")
                         if isinstance(prize, dict) else None)
+                credit = None
+                if isinstance(prize, dict):
+                    for k in ("credit", "value", "amount"):
+                        v = prize.get(k)
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            credit = int(v)
+                            break
                 res["drawn"].append(name or "已抽奖")
+                res["drawn_detail"].append({"name": name or "已抽奖",
+                                            "credit": credit})
 
         # 6) 派猫：到达先领，没出门就出发（每日上限内）
         try:

@@ -8,10 +8,12 @@ from pathlib import Path
 
 import cb_api
 import cb_cloud
+import cb_ledger
 import cb_log
 import cb_runtime
 import cb_secrets as cs
 import wb_api
+import wb_extra
 import wb_growth
 import wb_target
 from account_store import (DEFAULT_STORAGE_ID, AccountStore, build_ide_session,
@@ -371,6 +373,47 @@ def cloud_auto_pull(store: AccountStore) -> tuple[bool, str]:
     return cloud_pull(store, passphrase)
 
 
+# ---------- 积分记账 ----------
+def _phone_tail(rec: dict) -> str:
+    """从登录态里抠手机号后 4 位（打码的 181****3158 也取得到尾号）。"""
+    import re as _re
+    for plain in (rec.get("keys") or {}).values():
+        try:
+            obj = json.loads(plain)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        acc = obj.get("account") or {}
+        for v in (acc.get("phoneNumber"), (obj.get("profile_raw") or {}).get("phoneNumber")):
+            digits = _re.sub(r"\D", "", str(v or ""))
+            if len(digits) >= 4:
+                return digits[-4:]
+        tok = str((obj.get("auth") or {}).get("accessToken") or "")
+        parts = tok.split(".")
+        if len(parts) == 3:
+            try:
+                import base64 as _b64
+                payload = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(_b64.urlsafe_b64decode(payload))
+                pu = _re.sub(r"\D", "", str(claims.get("preferred_username") or ""))
+                if len(pu) >= 4:
+                    return pu[-4:]
+            except Exception:
+                pass
+    return ""
+
+
+def _ledger(rec: dict, source: str, detail: str = "", credit=None,
+            note: str = "") -> None:
+    """记一笔积分获取（失败不影响主流程）。"""
+    try:
+        cb_ledger.add(rec.get("uid") or "", rec.get("label") or "",
+                      _phone_tail(rec), source, detail, credit, note)
+    except Exception as e:  # noqa: BLE001
+        cb_log.log(f"记账失败 | {rec.get('label')} | {source} | {e}", "ledger")
+
+
 # ---------- WorkBuddy 积分签到 ----------
 def _save_checkin(store: AccountStore, rec: dict, res: dict) -> None:
     """把一次签到结果记回账号记录（供列表展示今日状态）。"""
@@ -413,6 +456,9 @@ def checkin_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
 
     ok = bool(res.get("ok")) or res.get("status") == wb_api.ALREADY_CLAIMED
     _save_checkin(store, rec, res)
+    if res.get("ok") and (res.get("credit") or 0) > 0:
+        detail = (f"连签 {res['streak_days']} 天" if res.get("streak_days") else "")
+        _ledger(rec, "checkin", detail, int(res["credit"]))
     text = wb_api.result_text(res)
     cb_log.log(f"签到 | {rec.get('label')} | {'OK' if ok else 'FAIL'} | {text}", "checkin")
     return ok, text
@@ -429,10 +475,231 @@ def refresh_all_sessions(store: AccountStore) -> list[tuple[str, bool, str]]:
         try:
             res = refresh_session(store, rec["id"])
             out.append((label, res.ok, res.message))
+            if not res.ok and _looks_auth_dead(res.message):
+                _mark_auth_dead(store, rec["id"], res.message)
         except Exception as e:  # noqa: BLE001
             out.append((label, False, str(e)))
     ok_n = sum(1 for _, ok, _ in out if ok)
     cb_log.log(f"批量续期 | 成功 {ok_n}/{len(out)}", "refresh")
+    return out
+
+
+# ---------- 账号测活 ----------
+def _looks_auth_dead(text: str) -> bool:
+    """错误文本是否像「登录态已死」（refresh token 失效类），而非临时网络故障。
+
+    12153 是网关的 refresh token 失效业务码（实测）；401/403 为 HTTP 层拒绝。
+    """
+    t = str(text or "")
+    return ("12153" in t or "HTTP 401" in t or "HTTP 403" in t
+            or "code=401" in t or "code=403" in t)
+
+
+def _mark_auth_dead(store: AccountStore, account_id: str, why: str) -> None:
+    """把账号卡上的测活状态标成「登录失效，需重新登录」。"""
+    try:
+        rec = store.get(account_id)
+        if not rec:
+            return
+        rec["liveness"] = {"at": _now(), "status": "auth_dead",
+                           "text": f"登录失效，需重新登录（{str(why)[:80]}）"}
+        store.update(rec)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def liveness_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
+    """测活：用现有令牌查一次额度；access 失效先自动续期再测。
+
+    结果三类：ok 正常 / auth_dead 登录失效（refresh 也救不回）/ error 其他
+    错误（原文摘要）。结果存进账号记录，卡片上展示最近一次。
+    """
+    rec = store.get(account_id)
+    if not rec:
+        return False, "账号不存在"
+    auth = record_auth(rec)
+    if not auth:
+        rec["liveness"] = {"at": _now(), "status": "auth_dead",
+                           "text": "登录失效，需重新登录（无可用令牌）"}
+        store.update(rec)
+        return False, rec["liveness"]["text"]
+
+    status, text = "error", ""
+    quota = cb_api.fetch_quota(auth)
+    if not quota.get("error"):
+        status, text = "ok", "正常"
+    else:
+        err = str(quota.get("error") or "")
+        if "401" in err and auth.get("refreshToken"):
+            try:
+                new_auth = cb_api.refresh_auth(auth)
+            except Exception as e:  # noqa: BLE001
+                if _looks_auth_dead(str(e)) or getattr(e, "status", None) in (401, 403):
+                    status, text = "auth_dead", "登录失效，需重新登录"
+                else:
+                    status, text = "error", f"续期失败：{str(e)[:100]}"
+            else:
+                try:
+                    _rebuild_keys_with_auth(rec, new_auth)
+                    rec["refreshed_at"] = _now()
+                except Exception:
+                    pass
+                quota2 = cb_api.fetch_quota(new_auth)
+                if not quota2.get("error"):
+                    status, text = "ok", "正常（已自动续期）"
+                else:
+                    status, text = "error", str(quota2.get("error") or "")[:100]
+        elif _looks_auth_dead(err):
+            status, text = "auth_dead", "登录失效，需重新登录"
+        else:
+            status, text = "error", err[:100]
+
+    rec["liveness"] = {"at": _now(), "status": status, "text": text}
+    store.update(rec)
+    cb_log.log(f"测活 | {rec.get('label')} | {status} | {text}", "liveness")
+    return status == "ok", text
+
+
+# ---------- 对话活跃上报（点亮连登 / 解锁领养前置） ----------
+def _streak_days(auth: dict):
+    """读连登天数（成长中心 streak 接口）；读不到返回 None。"""
+    try:
+        data = wb_growth._call("GET", wb_growth.STREAK_PATH, auth) or {}
+        streak = data.get("streak") or {}
+        days = streak.get("days")
+        return int(days) if isinstance(days, (int, float)) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def activity_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
+    """给单个账号发一条对话活跃上报，并回读连登天数自检。
+
+    上报返回成功但天数仍是 0 = 疑似被服务端静默丢弃，如实标注。
+    token 失效先自动续期再试一次。
+    """
+    rec = store.get(account_id)
+    if not rec:
+        return False, "账号不存在"
+    auth = record_auth(rec)
+    if not auth:
+        return False, "该账号没有可用的 access token"
+    uid = rec.get("uid") or ""
+    nickname = rec.get("label") or ""
+
+    rep = wb_extra.report_activity(auth, uid, nickname)
+    if not rep.get("ok") and auth.get("refreshToken") \
+            and _looks_auth_dead(rep.get("error") or ""):
+        try:
+            new_auth = cb_api.refresh_auth(auth)
+            _rebuild_keys_with_auth(rec, new_auth)
+            rec["refreshed_at"] = _now()
+            auth = new_auth
+            rep = wb_extra.report_activity(auth, uid, nickname)
+        except Exception:  # noqa: BLE001
+            pass
+    if not rep.get("ok"):
+        cb_log.log(f"活跃上报 | {rec.get('label')} | FAIL | {rep.get('error')}",
+                   "activity")
+        return False, f"上报失败：{rep.get('error')}"
+
+    days = _streak_days(auth)
+    rec["activity"] = {"date": time.strftime("%Y-%m-%d"), "days": days,
+                       "at": _now()}
+    store.update(rec)
+    if days is None:
+        text = "上报成功（连登天数未读到）"
+    elif days == 0:
+        text = "上报成功但连登天数仍为 0（疑似被静默丢弃）"
+    else:
+        text = f"上报成功 · 连登 {days} 天"
+    cb_log.log(f"活跃上报 | {rec.get('label')} | OK | {text}", "activity")
+    return True, text
+
+
+def activity_all(store: AccountStore) -> list[tuple[str, bool, str]]:
+    """给全部账号做活跃上报（每日全量里跑，每号每天 1 次）。"""
+    out = []
+    for rec in store.list_accounts():
+        try:
+            ok, text = activity_account(store, rec["id"])
+        except Exception as e:  # noqa: BLE001
+            ok, text = False, str(e)
+        out.append((rec.get("label") or rec.get("uid") or "?", ok, text))
+    return out
+
+
+# ---------- 积分补偿 / 新手礼包（官网网页会话） ----------
+def compensation_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
+    """查积分补偿 + 新手礼包，能领就领（幂等），进账记账。
+
+    走官网网页会话（登录码换 Cookie）；access token 失效先续期再试。
+    """
+    rec = store.get(account_id)
+    if not rec:
+        return False, "账号不存在"
+    auth = record_auth(rec)
+    if not auth:
+        return False, "该账号没有可用的 access token"
+    uid = rec.get("uid") or ""
+
+    comp = wb_extra.compensation(auth, uid)
+    if not comp.get("ok") and auth.get("refreshToken") \
+            and _looks_auth_dead(comp.get("error") or ""):
+        try:
+            new_auth = cb_api.refresh_auth(auth)
+            _rebuild_keys_with_auth(rec, new_auth)
+            rec["refreshed_at"] = _now()
+            auth = new_auth
+            comp = wb_extra.compensation(auth, uid)
+        except Exception:  # noqa: BLE001
+            pass
+    gift = wb_extra.claim_gift(auth, uid)
+
+    parts = []
+    if comp.get("ok"):
+        if comp.get("newly_claimed"):
+            parts.append(f"补偿新领 +{comp.get('credit') or 0}")
+            if (comp.get("credit") or 0) > 0:
+                _ledger(rec, "compensation", "积分补偿", int(comp["credit"]))
+        elif comp.get("claimed"):
+            parts.append("补偿已领过")
+        elif comp.get("active"):
+            parts.append("补偿开放中（未领成）")
+        else:
+            parts.append("补偿未开放")
+    else:
+        parts.append(f"补偿检查失败：{comp.get('error')}")
+    if gift.get("state") == "claimed_now":
+        parts.append(f"新手礼包 +{gift.get('credit') or 0}")
+        if (gift.get("credit") or 0) > 0:
+            _ledger(rec, "gift", "新手礼包", int(gift["credit"]))
+    elif gift.get("state") == "already":
+        parts.append("礼包已领过")
+    elif gift.get("state") == "inactive":
+        parts.append("礼包未开放")
+    else:
+        parts.append(f"礼包检查失败：{gift.get('error')}")
+
+    rec["compensation"] = {"at": _now(), "active": comp.get("active"),
+                            "claimed": comp.get("claimed"),
+                            "credit": comp.get("credit") or 0,
+                            "gift_state": gift.get("state") or ""}
+    store.update(rec)
+    text = "；".join(parts)
+    cb_log.log(f"补偿礼包 | {rec.get('label')} | {text}", "compensation")
+    return bool(comp.get("ok")), text
+
+
+def compensation_all(store: AccountStore) -> list[tuple[str, bool, str]]:
+    """给全部账号查/领积分补偿与新手礼包（每日全量里跑）。"""
+    out = []
+    for rec in store.list_accounts():
+        try:
+            ok, text = compensation_account(store, rec["id"])
+        except Exception as e:  # noqa: BLE001
+            ok, text = False, str(e)
+        out.append((rec.get("label") or rec.get("uid") or "?", ok, text))
     return out
 
 
@@ -502,10 +769,36 @@ def _save_growth(store: AccountStore, rec: dict, res: dict) -> None:
     store.update(rec)
 
 
-def growth_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
+def _ledger_growth(rec: dict, res: dict) -> None:
+    """把一次成长计划里的积分进账逐笔记账（数量未知的不编造，记 None）。"""
+    first = res.get("first") or {}
+    if first and (first.get("credit") or 0) > 0:
+        _ledger(rec, "task", "first_buddy 首只Buddy", int(first["credit"]))
+    for c in res.get("claimed") or []:
+        if c.get("message"):
+            continue  # 领取失败的条目不记
+        if (c.get("credit") or 0) > 0:
+            _ledger(rec, "task", c.get("code") or "", int(c["credit"]))
+    credits = res.get("redeem_credits") or {}
+    for tier in res.get("redeemed") or []:
+        credit = credits.get(tier)
+        _ledger(rec, "redeem", f"{tier} 档", credit,
+                "" if credit is not None else "档位表未列积分数，数量未知")
+    for d in res.get("drawn_detail") or []:
+        _ledger(rec, "lottery", d.get("name") or "", d.get("credit"),
+                "" if d.get("credit") is not None else "奖品未标注积分数")
+    travel = res.get("travel") or {}
+    if "claimed" in (travel.get("action") or "") and (travel.get("credit") or 0) > 0:
+        _ledger(rec, "travel", travel.get("location") or "", int(travel["credit"]))
+
+
+def growth_account(store: AccountStore, account_id: str,
+                   *, daily: bool = True) -> tuple[bool, str]:
     """给单个账号自动完成成长计划（接受任务/领奖/兑换/抽奖）。
 
     幂等：重复执行只处理增量；token 失效会先自动续期再试一次。
+    daily=False（每 2 小时的定时轮）跳过连登兑换与抽奖——这两样有
+    日次数/资格节奏，统一放每日全量里跑，避免超频。
     """
     rec = store.get(account_id)
     if not rec:
@@ -514,7 +807,7 @@ def growth_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
     if not auth:
         return False, "该账号没有可用的 access token"
 
-    res = wb_growth.run(auth)
+    res = wb_growth.run(auth, redeem=daily, draw=daily)
     if not res.get("ok") and auth.get("refreshToken") and _is_auth_error(res):
         try:
             new_auth = cb_api.refresh_auth(auth)
@@ -525,10 +818,12 @@ def growth_account(store: AccountStore, account_id: str) -> tuple[bool, str]:
                 _rebuild_keys_with_auth(rec, new_auth)
             except Exception:
                 pass
-            res = wb_growth.run(new_auth)
+            res = wb_growth.run(new_auth, redeem=daily, draw=daily)
 
     ok = bool(res.get("ok"))
     _save_growth(store, rec, res)
+    if ok:
+        _ledger_growth(rec, res)
     text = wb_growth.result_text(res)
     cb_log.log(f"成长计划 | {rec.get('label')} | {'OK' if ok else 'FAIL'} | {text}",
                "growth")
@@ -540,12 +835,12 @@ def _is_auth_error(res: dict) -> bool:
     return "HTTP 401" in err or "HTTP 403" in err
 
 
-def growth_all(store: AccountStore) -> list[tuple[str, bool, str]]:
+def growth_all(store: AccountStore, *, daily: bool = True) -> list[tuple[str, bool, str]]:
     """给账号库中全部账号跑成长计划，返回 [(账号名, 是否成功, 明细)]。"""
     out = []
     for rec in store.list_accounts():
         try:
-            ok, text = growth_account(store, rec["id"])
+            ok, text = growth_account(store, rec["id"], daily=daily)
         except Exception as e:  # noqa: BLE001
             ok, text = False, str(e)
         out.append((rec.get("label") or rec.get("uid") or "?", ok, text))
