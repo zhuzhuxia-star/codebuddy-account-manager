@@ -52,6 +52,20 @@ def _map_status(code) -> str:
         return UNKNOWN_BIZ_ERROR
 
 
+def _map_status_msg(code, msg: str) -> str:
+    """带服务端 msg 的状态映射。
+
+    业务码 10001 被网关复用：HTTP 400「今天已签到」是真已签，HTTP 500
+    「签到失败，请稍后重试」是临时失败——只按码判会把失败误报成已签到
+    （2026-11-26 实测两号中招）。msg 明确不是「已签到/已领取」时按未知
+    业务错误处理，让上层走续期重试、再不行如实记 FAIL。
+    """
+    st = _map_status(code)
+    if st == ALREADY_CLAIMED and msg and "已签到" not in msg and "已领取" not in msg:
+        return UNKNOWN_BIZ_ERROR
+    return st
+
+
 def _server_msg(text: str) -> str:
     """从异常文本里抠出服务端 msg（形如 `HTTP 400: {"code":10001,"msg":"..."}`）。"""
     i = text.find("{")
@@ -92,8 +106,8 @@ def checkin(auth: dict, endpoint: str | None = None) -> dict:
                                timeout=20, endpoint=endpoint)
     except cb_api.ApiError as e:
         # 服务端业务码（如 10001 今天已签到）也会带 HTTP 400，按业务结果处理
-        out["status"] = _map_status(e.code)
         out["message"] = _server_msg(str(e)) or ""
+        out["status"] = _map_status_msg(e.code, out["message"])
         out["label"] = STATUS_LABELS.get(out["status"], out["message"] or "失败")
         return out
     except Exception as e:  # noqa: BLE001
@@ -109,8 +123,8 @@ def checkin(auth: dict, endpoint: str | None = None) -> dict:
                    streak_days=data.get("streak_days") or 0,
                    is_streak_day=bool(data.get("is_streak_day")))
     else:
-        out["status"] = _map_status(code)
         out["message"] = resp.get("msg") or ""
+        out["status"] = _map_status_msg(code, out["message"])
     out["label"] = STATUS_LABELS.get(out["status"], out["message"] or "失败")
     return out
 

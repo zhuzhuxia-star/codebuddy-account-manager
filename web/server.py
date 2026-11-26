@@ -33,6 +33,11 @@ os.environ.setdefault("APPDATA", os.environ.get("CBW_DATA", str(Path.home() / ".
 import cb_app  # noqa: E402
 import cb_cloud  # noqa: E402
 import cb_log  # noqa: E402
+
+try:
+    import u3store  # noqa: E402  对象存储（/oos 页）；缺失/损坏不影响主服务
+except Exception:  # noqa: BLE001
+    u3store = None  # type: ignore
 from account_store import AccountStore, parse_pasted_text, quota_columns  # noqa: E402
 
 try:
@@ -509,6 +514,7 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
 <a class="btn gray" href="/import">导入账号</a>
 <a class="btn gray" href="/settings">设置</a>
 <a class="btn gray" href="/logs">日志</a>
+<a class="btn gray" href="/oos">对象存储</a>
 <form class="inline" method="post" action="/logout"><button class="gray">退出</button></form>
 </div>
 <div class="card small">共 {len(accounts)} 个账号 · 网关 {esc(conf.get('endpoint') or '默认')}
@@ -708,6 +714,360 @@ async function copyScript() {{
     return page("一键登录脚本", body)
 
 
+# ---------- 对象存储（Altare U3，桶 oos） ----------
+U3_BUCKET = "oos"
+U3_ENV = DATA_DIR / "u3.env"
+U3_MAX_UPLOAD = 5 * 1024 * 1024 * 1024  # 单文件上限 5GB（流式分片，内存恒定）
+U3_PART_SIZE = 16 * 1024 * 1024         # 分片大小 16MB
+U3_LINKS = DATA_DIR / "oos_links.json"  # 短链映射 {code: {key, exp}}
+U3_LINK_TTL = 7 * 86400                 # 分享短链有效期 7 天
+_links_lock = threading.Lock()
+
+
+def _load_links() -> dict:
+    try:
+        data = json.loads(U3_LINKS.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_links(links: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    U3_LINKS.write_text(json.dumps(links, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+
+
+def oos_short_code(key: str) -> str:
+    """给某个对象找一条未过期的短链代码，没有就新建（同一文件复用同一条）。"""
+    now = time.time()
+    with _links_lock:
+        links = _load_links()
+        links = {c: v for c, v in links.items() if float(v.get("exp") or 0) > now}
+        for code, v in links.items():
+            if v.get("key") == key:
+                _save_links(links)
+                return code
+        alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+        code = "".join(secrets.choice(alphabet) for _ in range(8))
+        while code in links:
+            code = "".join(secrets.choice(alphabet) for _ in range(8))
+        links[code] = {"key": key, "exp": now + U3_LINK_TTL}
+        _save_links(links)
+        return code
+
+
+def oos_short_target(code: str) -> str | None:
+    with _links_lock:
+        v = _load_links().get(code) or {}
+    if float(v.get("exp") or 0) > time.time():
+        return v.get("key") or None
+    return None
+
+
+def oos_log(ip: str, what: str, key: str, nbytes: int) -> None:
+    try:
+        line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {ip} {what} "
+                f"{key} {nbytes}\n")
+        with open(DATA_DIR / "oos_access.log", "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:  # noqa: BLE001  日志失败不影响下载
+        pass
+
+
+def u3_client():
+    if u3store is None:
+        return None
+    return u3store.load_client(U3_ENV)
+
+
+def _fmt_size(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if f < 1024 or unit == "GB":
+            return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
+        f /= 1024
+    return f"{f:.1f} GB"
+
+
+def _fmt_time(iso: str) -> str:
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso
+
+
+def oos_page(msg: str = "", is_err: bool = False) -> bytes:
+    cli = u3_client()
+    head = """<h1>对象存储 · Altare U3</h1>
+<p><a class="btn gray" href="/">返回账号列表</a></p>"""
+    if cli is None:
+        return page("对象存储", head + """<div class="card">对象存储凭据未配置
+（数据目录缺少 u3.env），暂时不可用。</div>""", msg, is_err)
+    try:
+        objs = cli.list_objects(U3_BUCKET)
+    except Exception as e:  # noqa: BLE001
+        return page("对象存储", head + f"""<div class="card">读取桶失败：{esc(e)}</div>""",
+                    msg, is_err)
+    total = sum(o["size"] for o in objs)
+    rows = []
+    for o in objs:
+        k = esc(o["key"])
+        ku = urllib.parse.quote(o["key"], safe="")
+        rows.append(
+            f"<tr><td style='word-break:break-all'>{k}</td>"
+            f"<td>{_fmt_size(o['size'])}</td><td>{esc(_fmt_time(o['modified']))}</td>"
+            f"<td style='white-space:nowrap'>"
+            f"<a class='btn' href='/oos/get?key={ku}'>下载</a> "
+            f"<a class='btn gray' href='/oos/link?key={ku}'>分享链接</a> "
+            f"<form class='inline' method='post' action='/oos/delete' "
+            f"onsubmit=\"return confirm('确定删除 {k} ？')\">"
+            f"<input type='hidden' name='key' value='{k}'>"
+            f"<button class='red'>删除</button></form></td></tr>")
+    body = head + f"""
+<div class="card small">桶 <b>{esc(U3_BUCKET)}</b>（US 区）· 共 {len(objs)} 个文件 ·
+已用 {_fmt_size(total)} / 10 GB（免费额度）· 桶为私有：下载经本站中转，
+分享的是 7 天有效的短链</div>
+<div class="card"><h2>上传文件</h2>
+<form id="oosup" method="post" action="/oos/upload" enctype="multipart/form-data">
+<label>目录前缀（可空，如 img/2026 ，文件会存到该目录下）</label>
+<input name="prefix" placeholder="">
+<input type="file" name="file" multiple required>
+<button type="submit">上传</button>
+<span class="small">单个文件最大 5GB（流式分片上传，不占服务器内存）</span>
+<div id="oosprog" style="display:none;margin-top:8px">
+<progress id="oosbar" max="100" value="0" style="width:100%"></progress>
+<div class="small" id="oostext"></div></div></form></div>
+<div class="card"><h2>文件列表</h2>
+<input id="oosfilter" placeholder="输入关键字过滤…" oninput="oosFilter(this.value)">
+<table><tr><th>文件名</th><th>大小</th><th>修改时间</th><th>操作</th></tr>
+{''.join(rows) if rows else '<tr><td colspan="4">（空桶，上传第一个文件吧）</td></tr>'}
+</table></div>
+<script>
+function oosFilter(v) {{
+  v = v.toLowerCase();
+  document.querySelectorAll('table tr').forEach((tr, i) => {{
+    if (i === 0) return;
+    tr.style.display = tr.textContent.toLowerCase().includes(v) ? '' : 'none';
+  }});
+}}
+const oosForm = document.getElementById('oosup');
+if (oosForm) oosForm.addEventListener('submit', (e) => {{
+  e.preventDefault();
+  const box = document.getElementById('oosprog');
+  const bar = document.getElementById('oosbar');
+  const txt = document.getElementById('oostext');
+  box.style.display = 'block';
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/oos/upload');
+  xhr.upload.onprogress = (ev) => {{
+    if (ev.lengthComputable) {{
+      const pct = Math.round(ev.loaded * 100 / ev.total);
+      bar.value = pct;
+      txt.textContent = '正在上传：' + pct + '%（' +
+        (ev.loaded / 1048576).toFixed(1) + ' / ' + (ev.total / 1048576).toFixed(1) +
+        ' MB）— 大文件要几分钟，别关页面';
+    }}
+  }};
+  xhr.onload = () => {{ location.href = xhr.responseURL || '/oos'; }};
+  xhr.onerror = () => {{ txt.textContent = '上传中断，请重试'; }};
+  xhr.send(new FormData(oosForm));
+}});
+</script>"""
+    return page("对象存储", body, msg, is_err)
+
+
+def oos_link_page(key: str) -> bytes:
+    if not key:
+        return page("分享链接", "<h1>分享链接</h1><div class='card'>不可用</div>")
+    code = oos_short_code(key)
+    # 域名写死正式入口：他有时从沙盒直达地址打开面板，用 Host 头拼链接会拼出
+    # se-sto11.tryaltare.ai:端口 这种外部打不开的地址。
+    url = f"https://koi.ipv64.de/oos/s/{code}"
+    body = f"""<h1>分享链接（7 天有效）</h1>
+<p><a class="btn gray" href="/oos">返回对象存储</a></p>
+<div class="card"><p>文件：<b>{esc(key)}</b></p>
+<textarea id="oosurl" rows="3" readonly>{esc(url)}</textarea>
+<button onclick="oosCopy()">复制链接</button>
+<p class="small">任何人拿到这条短链都能在 7 天内下载该文件（不用登录），过期自动失效；
+同一文件重复生成的是同一条链接。</p></div>
+<script>
+async function oosCopy() {{
+  const t = document.getElementById('oosurl');
+  try {{ await navigator.clipboard.writeText(t.value); alert('已复制'); }}
+  catch (e) {{ t.select(); document.execCommand('copy'); alert('已复制'); }}
+}}
+</script>"""
+    return page("分享链接", body)
+
+
+class _BodyReader:
+    """按 Content-Length 计量的请求体缓冲读取器（流式 multipart 解析用）。"""
+
+    def __init__(self, rfile, total: int):
+        self.rfile = rfile
+        self.left = total
+        self.buf = bytearray()
+
+    def _fill_more(self) -> bool:
+        if self.left <= 0:
+            return False
+        chunk = self.rfile.read(min(256 * 1024, self.left))
+        if not chunk:
+            self.left = 0
+            return False
+        self.left -= len(chunk)
+        self.buf += chunk
+        return True
+
+    def read_until(self, needle: bytes, sink=None):
+        """消费到 needle 之前的内容：sink 给定时喂给 sink 并返回 b''，
+        否则收集后返回；找不到（EOF）返回 None。"""
+        out = bytearray()
+        keep = len(needle) - 1
+        while True:
+            idx = self.buf.find(needle)
+            if idx >= 0:
+                data = bytes(self.buf[:idx])
+                del self.buf[:idx + len(needle)]
+                if sink:
+                    sink(data)
+                else:
+                    out += data
+                return bytes(out)
+            if len(self.buf) > keep:
+                data = bytes(self.buf[:len(self.buf) - keep])
+                del self.buf[:len(self.buf) - keep]
+                if sink:
+                    sink(data)
+                else:
+                    out += data
+            if not self._fill_more():
+                return None
+
+    def read_exact(self, n: int) -> bytes:
+        while len(self.buf) < n and self._fill_more():
+            pass
+        data = bytes(self.buf[:n])
+        del self.buf[:n]
+        return data
+
+    def drain(self) -> None:
+        try:
+            while self.left > 0:
+                chunk = self.rfile.read(min(256 * 1024, self.left))
+                if not chunk:
+                    break
+                self.left -= len(chunk)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _SoftUploadErr(Exception):
+    """单个文件的软失败：记下原因，继续处理同批其它文件。"""
+
+
+class _PartSink:
+    """把一个文件的内容流式切成 16MB 分片，直传 U3 分片上传接口。"""
+
+    def __init__(self, cli, key: str, ctype: str):
+        self.cli = cli
+        self.key = key
+        self.ctype = ctype or ""
+        self.buf = bytearray()
+        self.parts: list[tuple[int, str]] = []
+        self.total = 0
+        self.uid: str | None = None
+        self.err = ""
+
+    def feed(self, data: bytes) -> None:
+        if self.err:
+            return
+        self.total += len(data)
+        if self.total > U3_MAX_UPLOAD:
+            self.err = "超过 5GB 上限"
+            return
+        self.buf += data
+        while len(self.buf) >= U3_PART_SIZE:
+            chunk = bytes(self.buf[:U3_PART_SIZE])
+            del self.buf[:U3_PART_SIZE]
+            self._send(chunk)
+
+    def _send(self, chunk: bytes) -> None:
+        if self.uid is None:
+            self.uid = self.cli.mp_create(U3_BUCKET, self.key, self.ctype)
+        etag = self.cli.mp_upload_part(U3_BUCKET, self.key, self.uid,
+                                       len(self.parts) + 1, chunk)
+        self.parts.append((len(self.parts) + 1, etag))
+
+    def finish(self) -> None:
+        if self.err:
+            if self.uid:
+                self.cli.mp_abort(U3_BUCKET, self.key, self.uid)
+            raise _SoftUploadErr(self.err)
+        try:
+            if self.total == 0:
+                self.cli.put_object(U3_BUCKET, self.key, b"", self.ctype)
+                return
+            if self.buf:
+                self._send(bytes(self.buf))
+                self.buf.clear()
+            self.cli.mp_complete(U3_BUCKET, self.key, self.uid, self.parts)
+        except Exception:
+            if self.uid:
+                self.cli.mp_abort(U3_BUCKET, self.key, self.uid)
+            raise
+
+
+def _stream_upload(reader: _BodyReader, boundary: bytes, cli):
+    """流式解析 multipart 请求体，逐个文件直传 U3。返回 (done, errs)。"""
+    import re as _re
+    first = reader.read_until(b"\r\n")
+    if first is None or not first.startswith(b"--" + boundary):
+        raise ValueError("multipart 起始边界不对")
+    needle = b"\r\n--" + boundary
+    prefix = ""
+    done: list[str] = []
+    errs: list[str] = []
+    while True:
+        head = reader.read_until(b"\r\n\r\n")
+        if head is None:
+            break
+        htext = head.decode("utf-8", "replace")
+        disp = _re.search(r"Content-Disposition:[^\r\n]*", htext)
+        d = disp.group(0) if disp else ""
+        name_m = _re.search(r'name="([^"]*)"', d)
+        fn_m = _re.search(r'filename="([^"]*)"', d)
+        ct_m = _re.search(r"Content-Type:\s*([^\r\n]+)", htext)
+        ctype = ct_m.group(1).strip() if ct_m else ""
+        field = name_m.group(1) if name_m else ""
+        if fn_m is None:
+            val = reader.read_until(needle)
+            if field == "prefix" and val is not None:
+                prefix = val.decode("utf-8", "replace").strip().strip("/")
+        elif fn_m.group(1) == "":
+            reader.read_until(needle, lambda _d: None)  # 空文件框，丢弃
+        else:
+            name = fn_m.group(1).replace("\\", "/").split("/")[-1].strip()
+            key = f"{prefix}/{name}" if prefix else name
+            sink = _PartSink(cli, key, ctype)
+            reader.read_until(needle, sink.feed)
+            try:
+                sink.finish()
+                done.append(key)
+            except _SoftUploadErr as e:
+                errs.append(f"{name}：{e}")
+        tail = reader.read_exact(2)
+        if tail == b"--":
+            break
+        if tail != b"\r\n":
+            break
+    return done, errs
+
+
+
 # ---------- HTTP ----------
 class Handler(BaseHTTPRequestHandler):
     server_version = "CBAMWeb/1.0"
@@ -752,6 +1112,84 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         return session_ok(self._cookie_token())
 
+    def _oos_serve(self, key_or_code: str, public: bool):
+        """把对象内容经本站流式中转出去（下载地址始终是本站域名）。"""
+        ip = (self.headers.get("X-Forwarded-For") or
+              self.client_address[0]).split(",")[0].strip()
+        if public:
+            key = oos_short_target(key_or_code.strip())
+            if not key:
+                oos_log(ip, "MISS", key_or_code.strip(), 0)
+                return self._send(404, page("链接不存在",
+                                            "<h1>链接不存在或已过期</h1>"))
+        else:
+            key = key_or_code
+        cli = u3_client()
+        if cli is None:
+            return self._send(503, page("不可用", "<h1>对象存储未配置</h1>"))
+        try:
+            headers, resp = cli.open_get(U3_BUCKET, key)
+        except Exception as e:  # noqa: BLE001
+            if public:
+                return self._send(404, page("链接不存在", "<h1>文件不存在</h1>"))
+            return self._redirect("/oos", f"下载失败：{e}", True)
+        name = key.rsplit("/", 1)[-1] or "download"
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         headers.get("Content-Type") or "application/octet-stream")
+        clen = headers.get("Content-Length")
+        if clen:
+            self.send_header("Content-Length", clen)
+        self.send_header("Content-Disposition",
+                         "attachment; filename*=UTF-8''"
+                         + urllib.parse.quote(name))
+        self.end_headers()
+        sent = 0
+        try:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                sent += len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            resp.close()
+            oos_log(ip, "SHORT" if public else "GET", key, sent)
+
+    def _oos_upload(self):
+        conf = load_conf()
+        if not conf.get("pw_hash"):
+            return self._redirect("/setup")
+        if not self._authed():
+            return self._redirect("/login")
+        cli = u3_client()
+        if cli is None:
+            return self._redirect("/oos", "对象存储凭据未配置", True)
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return self._redirect("/oos", "没有收到文件", True)
+        if n > U3_MAX_UPLOAD + 4 * 1024 * 1024:
+            return self._redirect("/oos", "文件太大（单文件上限 5GB）", True)
+        import re as _re
+        m = _re.search(r"boundary=(.+)", self.headers.get("Content-Type") or "")
+        if not m:
+            return self._redirect("/oos", "上传格式不对", True)
+        boundary = m.group(1).strip().strip('"').encode()
+        reader = _BodyReader(self.rfile, n)
+        try:
+            done, errs = _stream_upload(reader, boundary, cli)
+        except Exception as e:  # noqa: BLE001
+            reader.drain()
+            return self._redirect("/oos", f"上传失败：{e}", True)
+        if not done and not errs:
+            return self._redirect("/oos", "没有可上传的文件", True)
+        msg = f"已上传 {len(done)} 个文件" if done else ""
+        if errs:
+            msg = (msg + "；" if msg else "") + "失败：" + "；".join(errs)
+        return self._redirect("/oos", msg, bool(errs and not done))
+
     # -- 路由 --
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -769,6 +1207,8 @@ class Handler(BaseHTTPRequestHandler):
             if self._authed():
                 return self._redirect("/")
             return self._send(200, login_page(msg, is_err))
+        if u.path.startswith("/oos/s/"):
+            return self._oos_serve(u.path[len("/oos/s/"):], public=True)
         if not self._authed():
             return self._redirect("/login")
 
@@ -782,6 +1222,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, settings_page(msg, is_err))
         if u.path == "/logs":
             return self._send(200, logs_page())
+        if u.path == "/oos":
+            return self._send(200, oos_page(msg, is_err))
+        if u.path == "/oos/get":
+            key = q.get("key", "")
+            if not key:
+                return self._redirect("/oos", "下载不可用", True)
+            return self._oos_serve(key, public=False)
+        if u.path == "/oos/link":
+            return self._send(200, oos_link_page(q.get("key", "")))
         if u.path == "/jobstatus":
             data = {"running": bool(_job_state.get("running")),
                     "name": _job_state.get("name") or "",
@@ -812,6 +1261,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/oos/upload":
+            return self._oos_upload()
         form = self._form()
         conf = load_conf()
 
@@ -880,6 +1331,16 @@ class Handler(BaseHTTPRequestHandler):
             with RUN_LOCK:
                 ok = store.remove(form.get("id", ""))
             return self._redirect("/", "已删除" if ok else "账号不存在", not ok)
+        if u.path == "/oos/delete":
+            cli = u3_client()
+            key = form.get("key", "")
+            if cli is None or not key:
+                return self._redirect("/oos", "删除不可用", True)
+            try:
+                cli.delete_object(U3_BUCKET, key)
+            except Exception as e:  # noqa: BLE001
+                return self._redirect("/oos", f"删除失败：{e}", True)
+            return self._redirect("/oos", f"已删除 {key}")
         if u.path == "/import/paste":
             text = form.get("text", "")
             if not text.strip():
