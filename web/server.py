@@ -381,6 +381,30 @@ font-size:13px;color:#374151;font-weight:600}
 .pkexp.soon{color:#ea580c;font-weight:600}
 .pkbar{height:3px;background:#f3f4f6;border-radius:2px;margin-top:3px;overflow:hidden}
 .pkbar i{display:block;height:100%;background:#f97316;border-radius:2px}
+.pkhead.clickable{cursor:pointer}
+.pkhead.clickable:hover .pkgo{color:#2563eb;text-decoration:underline}
+.pkgo{color:#2563eb}
+.mask{position:fixed;inset:0;background:rgba(17,24,39,.5);z-index:50;
+display:flex;align-items:center;justify-content:center;padding:14px}
+.modal{background:#fff;border-radius:14px;width:min(560px,94vw);max-height:84vh;
+display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.mhead{display:flex;justify-content:space-between;align-items:center;gap:10px;
+padding:13px 16px;border-bottom:1px solid #eef0f3}
+.mtitle{font-size:15px;font-weight:600;word-break:break-all}
+.mclose{flex:none;background:#f3f4f6;color:#374151;border:1px solid #e5e7eb;
+width:30px;height:30px;border-radius:8px;font-size:17px;line-height:1;padding:0;margin:0}
+.mbody{overflow-y:auto;padding:6px 16px 14px}
+.mrow{display:flex;align-items:baseline;gap:8px;font-size:13px;padding:8px 0;
+border-bottom:1px solid #f5f6f8}
+.mrow:last-child{border-bottom:none}
+.mname{flex:1;color:#374151;word-break:break-all}
+.mamt{white-space:nowrap;color:#6b7280;font-size:12px}
+.mamt b{color:#111827;font-size:13px}
+.mexp{white-space:nowrap;font-size:12px;color:#6b7280}
+.mexp.soon{color:#ea580c;font-weight:600}
+.mrow.used{opacity:.5}
+.mtag{flex:none;background:#f3f4f6;color:#6b7280;border-radius:999px;
+padding:1px 8px;font-size:11px;white-space:nowrap}
 .aacts{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid #f0f1f4;
 margin-top:12px;padding-top:10px}
 .aacts form{margin:0}
@@ -460,6 +484,55 @@ document.querySelectorAll('form').forEach(f => {
 </script>"""
 
 
+PKG_JS = """
+<div id="pkgmask" class="mask" style="display:none" onclick="if(event.target===this)closePkgs()">
+<div class="modal" role="dialog" aria-modal="true">
+<div class="mhead"><span class="mtitle" id="pktitle"></span>
+<button type="button" class="mclose" onclick="closePkgs()" title="关闭">✕</button></div>
+<div class="mbody" id="pkbody"></div>
+</div></div>
+<script>
+const PKGDATA = __PKGDATA__;
+function fmtCr(v) {
+  const f = parseFloat(v);
+  if (isNaN(f)) return '-';
+  let s = (f === Math.trunc(f)) ? String(Math.trunc(f))
+    : f.toFixed(2).replace(/0+$/, '').replace(/\\.$/, '');
+  const neg = s.startsWith('-'); if (neg) s = s.slice(1);
+  const parts = s.split('.');
+  parts[0] = parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+  return (neg ? '-' : '') + parts.join('.');
+}
+function escH(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+function openPkgs(id) {
+  const d = PKGDATA[id]; if (!d) return;
+  document.getElementById('pktitle').textContent =
+    d.label + ' · 共 ' + d.pkgs.length + ' 个积分包';
+  const now = Date.now();
+  const pkgs = d.pkgs.slice().sort((a, b) => (a.e || Infinity) - (b.e || Infinity));
+  document.getElementById('pkbody').innerHTML = pkgs.map(p => {
+    const used = !(p.l > 0);
+    let exp = '—', soon = false;
+    if (p.e) {
+      const dt = new Date(p.e);
+      exp = dt.getFullYear() + '/' + (dt.getMonth() + 1) + '/' + dt.getDate() + ' 到期';
+      soon = p.e - now <= 3 * 86400 * 1000;
+    }
+    return '<div class="mrow' + (used ? ' used' : '') + '"><span class="mname">' +
+      escH(p.n) + '</span><span class="mamt">剩余 <b>' + fmtCr(p.l) + '</b> / ' +
+      fmtCr(p.t) + '</span>' + (used ? '<span class="mtag">已用完</span>' : '') +
+      '<span class="mexp' + (soon && !used ? ' soon' : '') + '">' + exp + '</span></div>';
+  }).join('');
+  document.getElementById('pkgmask').style.display = 'flex';
+}
+function closePkgs() { document.getElementById('pkgmask').style.display = 'none'; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePkgs(); });
+</script>"""
+
+
 def _full_phone(rec: dict) -> str:
     """从存量登录态里还原完整手机号：JWT 的 preferred_username 优先，
     其次 account.phoneNumber（未打码时）。取不到返回空串。"""
@@ -536,6 +609,7 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
     today = time.strftime("%Y-%m-%d")
 
     cards = []
+    pkg_data = {}
     for rec in accounts:
         plan, _quota_text = quota_columns(rec)
         q = rec.get("quota") or {}
@@ -589,8 +663,22 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
         cnt_html = f"<span class='small'>{pkg_cnt} 个积分包</span>" if pkg_cnt else ""
         upd = str(q.get("updated_at") or "")
         upd_html = f"<span class='small'>{esc(upd[11:16])} 更新</span>" if len(upd) >= 16 else ""
-        more_html = (f"<span class='small'>还有 {pkg_more} 个未列出</span>"
+        more_html = (f"<span class='small pkgo'>还有 {pkg_more} 个未列出 ›</span>"
                      if pkg_more else "")
+        # 全量包数据随页面带下来，点「近期到期」标题区弹窗前端展示（不新增接口）
+        raw_pkgs = [p for p in (q.get("packages") or []) if isinstance(p, dict)]
+        if raw_pkgs:
+            pkg_data[str(rec.get("id") or "")] = {
+                "label": disp,
+                "pkgs": [{"n": str(p.get("name") or ""), "l": p.get("left") or 0,
+                          "t": p.get("total") or 0, "e": p.get("expire_ms") or 0}
+                         for p in raw_pkgs],
+            }
+        pkhead_html = (
+            f"<div class='pkhead clickable' title='点击查看全部积分包' "
+            f"onclick=\"openPkgs('{rid}')\"><span>近期到期</span>{more_html}</div>"
+            if pkg_cnt else
+            f"<div class='pkhead'><span>近期到期</span>{more_html}</div>")
         cards.append(
             f"<div class='acard'>"
             f"<div class='ahead'><div><div class='aname'>{esc(disp)}</div>"
@@ -601,7 +689,7 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             f"<span>成长计划：{esc(gr_text or '-')}</span>"
             f"{lv_html}"
             f"<span>上次续期：{esc(rec.get('refreshed_at') or '-')}</span></div>"
-            f"<div class='pkhead'><span>近期到期</span>{more_html}</div>"
+            f"{pkhead_html}"
             f"{pkg_html}"
             f"<div class='aacts'>"
             f"<form method='post' action='/run/checkin'>"
@@ -642,7 +730,8 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
 · 每日 {esc(conf.get('daily_time') or '09:05')} 自动全量 · 成长计划每 {esc(conf.get('growth_every_hours'))} 小时
 · {esc(cb_app.cloud_status())}</div>
 {('<div class="cards">' + ''.join(cards) + '</div>') if cards else '<div class="card">还没有账号，去「导入账号」粘贴登录态或用云端同步拉取。</div>'}
-{last}""" + DASH_JS
+{last}""" + PKG_JS.replace("__PKGDATA__",
+                            json.dumps(pkg_data, ensure_ascii=False).replace("</", "<\\/")) + DASH_JS
     return page("账号列表", body, msg, is_err)
 
 
