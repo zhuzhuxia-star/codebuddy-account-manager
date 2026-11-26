@@ -23,6 +23,7 @@ import secrets
 import threading
 import time
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -352,6 +353,31 @@ td form{margin:0}
 border-top-color:#2563eb;border-radius:50%;animation:sp .8s linear infinite;
 vertical-align:-2px;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:12px;margin:10px 0}
+.acard{background:#fff;border:1px solid #e2e4e9;border-radius:14px;padding:14px 16px;
+box-shadow:0 1px 3px rgba(16,24,40,.06)}
+.ahead{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.aname{font-size:16px;font-weight:600;word-break:break-all}
+.apill{flex:none;background:#eef2ff;color:#3730a3;border-radius:999px;
+padding:2px 10px;font-size:12px;white-space:nowrap}
+.abig{display:flex;align-items:baseline;gap:9px;margin:10px 0 0;flex-wrap:wrap}
+.abig .num{font-size:26px;font-weight:700}
+.ameta{display:flex;gap:6px 12px;flex-wrap:wrap;color:#6b7280;font-size:12px;margin:7px 0 0}
+.pkhead{display:flex;justify-content:space-between;align-items:center;
+border-top:1px solid #f0f1f4;margin-top:11px;padding-top:10px;
+font-size:13px;color:#374151;font-weight:600}
+.pkrow{display:flex;align-items:baseline;gap:8px;font-size:13px;margin-top:8px}
+.pkleft{font-weight:600;white-space:nowrap}
+.pkname{color:#6b7280;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pkexp{color:#6b7280;white-space:nowrap;font-size:12px}
+.pkexp.soon{color:#ea580c;font-weight:600}
+.pkbar{height:3px;background:#f3f4f6;border-radius:2px;margin-top:3px;overflow:hidden}
+.pkbar i{display:block;height:100%;background:#f97316;border-radius:2px}
+.aacts{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid #f0f1f4;
+margin-top:12px;padding-top:10px}
+.aacts form{margin:0}
+.aacts button,.aacts .btn{margin:0;padding:6px 12px;font-size:13px;border-radius:6px}
+.aacts button.red{background:#fff;color:#dc2626;border:1px solid #f0b8b2}
 #jobbar{display:none;background:#eff6ff;border:1px solid #3b82f6;color:#1e3a8a;
 border-radius:8px;padding:9px 12px;margin:10px 0;font-size:14px}
 """
@@ -452,15 +478,61 @@ def _full_phone(rec: dict) -> str:
     return ""
 
 
+def _fmt_credits(v) -> str:
+    """积分数格式化：千分位；整数不带小数，非整数最多两位小数（与参考样式一致）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    if f == int(f):
+        return f"{int(f):,}"
+    return f"{f:,.2f}".rstrip("0").rstrip(".")
+
+
+def _pkg_rows_html(q: dict) -> tuple[str, int, int]:
+    """渲染「近期到期」积分包行：只列 left>0、按到期时间从近到远、最多 4 条。
+
+    返回 (html, 包总数, 未列出的剩余包数)。expire_ms 为 0/缺失的包排最后、
+    到期日显示「—」；3 天内到期（含缓存已过期）标橙。每行下带一条
+    left/total 比例的细进度条，与参考卡片样式一致。
+    """
+    pkgs = [p for p in (q.get("packages") or []) if isinstance(p, dict)]
+    live = [p for p in pkgs if (p.get("left") or 0) > 0]
+    live.sort(key=lambda p: (not (p.get("expire_ms") or 0), p.get("expire_ms") or 0))
+    now_ms = int(time.time() * 1000)
+    rows = []
+    for p in live[:4]:
+        ems = p.get("expire_ms") or 0
+        if ems:
+            d = datetime.fromtimestamp(ems / 1000)
+            exp = f"{d.month}/{d.day} 到期"
+            soon = ems - now_ms <= 3 * 86400 * 1000
+        else:
+            exp, soon = "—", False
+        total = p.get("total") or 0
+        pct = min(100.0, max(0.0, (p.get("left") or 0) / total * 100)) if total else 100.0
+        rows.append(
+            f"<div class='pkrow'><span class='pkleft'>{esc(_fmt_credits(p.get('left')))} 积分</span>"
+            f"<span class='pkname'>{esc(p.get('name') or '')}</span>"
+            f"<span class='pkexp{' soon' if soon else ''}'>{esc(exp)}</span></div>"
+            f"<div class='pkbar'><i style='width:{pct:.0f}%'></i></div>")
+    if not rows:
+        rows.append("<div class='small' style='margin-top:8px'>暂无积分包明细，点下方「额度」刷新</div>")
+    return "".join(rows), len(pkgs), max(0, len(live) - 4)
+
+
 def dashboard(msg: str = "", is_err: bool = False) -> bytes:
     conf = load_conf()
     store = AccountStore()
     accounts = store.list_accounts()
     today = time.strftime("%Y-%m-%d")
 
-    rows = []
+    cards = []
     for rec in accounts:
-        plan, quota_text = quota_columns(rec)
+        plan, _quota_text = quota_columns(rec)
+        q = rec.get("quota") or {}
+        if not isinstance(q, dict):
+            q = {}
         ck = rec.get("checkin") or {}
         if ck.get("date") == today:
             ck_text = f"{ck.get('label') or ck.get('status') or '-'}"
@@ -479,13 +551,34 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
         sub = esc(rec.get('uid') or '')
         if phone and phone != disp:
             sub = (sub + ' · ' if sub else '') + '手机 ' + esc(phone)
-        rows.append(
-            f"<tr><td><b>{esc(disp)}</b>"
-            f"<div class='small'>{sub}</div></td>"
-            f"<td>{esc(plan)}<div class='small'>{esc(quota_text)}</div></td>"
-            f"<td>{esc(ck_text)}</td><td>{esc(gr_text or '-')}</td>"
-            f"<td class='small'>{esc(rec.get('refreshed_at') or '-')}</td>"
-            f"<td><div class='acts'>"
+        # 大字剩余总积分（兼容旧缓存 total_remain）
+        left = q.get("usage_left")
+        if left is None:
+            left = q.get("total_remain")
+        if q.get("error") and left is None:
+            big = "<span class='num' style='font-size:18px'>查询失败</span>"
+        elif left is None:
+            big = "<span class='num'>-</span>"
+        else:
+            big = f"<span class='num'>⚡ {_fmt_credits(left)}</span>"
+        pkg_html, pkg_cnt, pkg_more = _pkg_rows_html(q)
+        cnt_html = f"<span class='small'>{pkg_cnt} 个积分包</span>" if pkg_cnt else ""
+        upd = str(q.get("updated_at") or "")
+        upd_html = f"<span class='small'>{esc(upd[11:16])} 更新</span>" if len(upd) >= 16 else ""
+        more_html = (f"<span class='small'>还有 {pkg_more} 个未列出</span>"
+                     if pkg_more else "")
+        cards.append(
+            f"<div class='acard'>"
+            f"<div class='ahead'><div><div class='aname'>{esc(disp)}</div>"
+            f"<div class='small'>{sub}</div></div>"
+            f"<span class='apill'>{esc(plan)}</span></div>"
+            f"<div class='abig'>{big}{cnt_html}{upd_html}</div>"
+            f"<div class='ameta'><span>签到：{esc(ck_text)}</span>"
+            f"<span>成长计划：{esc(gr_text or '-')}</span>"
+            f"<span>上次续期：{esc(rec.get('refreshed_at') or '-')}</span></div>"
+            f"<div class='pkhead'><span>近期到期</span>{more_html}</div>"
+            f"{pkg_html}"
+            f"<div class='aacts'>"
             f"<form method='post' action='/run/checkin'>"
             f"<input type='hidden' name='id' value='{rid}'><button>签到</button></form>"
             f"<form method='post' action='/run/refresh'>"
@@ -496,7 +589,7 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             f"<form method='post' action='/account/delete' "
             f"onsubmit='return confirm(\"确定删除这个账号？\")'>"
             f"<input type='hidden' name='id' value='{rid}'><button class='red'>删除</button></form>"
-            f"</div></td></tr>")
+            f"</div></div>")
 
     last = ""
     if _last_run.get("lines"):
@@ -520,9 +613,7 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
 <div class="card small">共 {len(accounts)} 个账号 · 网关 {esc(conf.get('endpoint') or '默认')}
 · 每日 {esc(conf.get('daily_time') or '09:05')} 自动全量 · 成长计划每 {esc(conf.get('growth_every_hours'))} 小时
 · {esc(cb_app.cloud_status())}</div>
-<div class="card"><table><tr><th>账号</th><th>套餐/额度</th><th>签到</th><th>成长计划</th><th>上次续期</th><th>操作</th></tr>
-{''.join(rows) if rows else '<tr><td colspan="6">还没有账号，去「导入账号」粘贴登录态或用云端同步拉取。</td></tr>'}
-</table></div>
+{('<div class="cards">' + ''.join(cards) + '</div>') if cards else '<div class="card">还没有账号，去「导入账号」粘贴登录态或用云端同步拉取。</div>'}
 {last}""" + DASH_JS
     return page("账号列表", body, msg, is_err)
 
@@ -1128,21 +1219,29 @@ class Handler(BaseHTTPRequestHandler):
         if cli is None:
             return self._send(503, page("不可用", "<h1>对象存储未配置</h1>"))
         try:
-            headers, resp = cli.open_get(U3_BUCKET, key)
+            status, headers, resp = cli.open_get(
+                U3_BUCKET, key, self.headers.get("Range"))
         except Exception as e:  # noqa: BLE001
             if public:
                 return self._send(404, page("链接不存在", "<h1>文件不存在</h1>"))
             return self._redirect("/oos", f"下载失败：{e}", True)
         name = key.rsplit("/", 1)[-1] or "download"
-        self.send_response(200)
-        self.send_header("Content-Type",
-                         headers.get("Content-Type") or "application/octet-stream")
+        ctype = headers.get("Content-Type") or "application/octet-stream"
+        # 公开分享的音视频/图片走 inline，浏览器直接在线播放；其余仍是下载。
+        inline = public and ctype.split(";")[0].strip().startswith(
+            ("audio/", "video/", "image/"))
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
         clen = headers.get("Content-Length")
         if clen:
             self.send_header("Content-Length", clen)
+        crange = headers.get("Content-Range")
+        if crange:
+            self.send_header("Content-Range", crange)
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Disposition",
-                         "attachment; filename*=UTF-8''"
-                         + urllib.parse.quote(name))
+                         ("inline" if inline else "attachment")
+                         + "; filename*=UTF-8''" + urllib.parse.quote(name))
         self.end_headers()
         sent = 0
         try:
@@ -1189,6 +1288,32 @@ class Handler(BaseHTTPRequestHandler):
         if errs:
             msg = (msg + "；" if msg else "") + "失败：" + "；".join(errs)
         return self._redirect("/oos", msg, bool(errs and not done))
+
+    def do_HEAD(self):
+        """短链的 HEAD 探测（播放器开播前常先发）：只回头、不回体。"""
+        u = urllib.parse.urlparse(self.path)
+        if u.path.startswith("/oos/s/"):
+            key = oos_short_target(u.path[len("/oos/s/"):].strip())
+            cli = u3_client() if key else None
+            if key and cli is not None:
+                try:
+                    headers = cli.open_head(U3_BUCKET, key)
+                except Exception:  # noqa: BLE001
+                    headers = None
+                if headers is not None:
+                    ctype = (headers.get("Content-Type")
+                             or "application/octet-stream")
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    if headers.get("Content-Length"):
+                        self.send_header("Content-Length",
+                                         headers["Content-Length"])
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     # -- 路由 --
     def do_GET(self):
