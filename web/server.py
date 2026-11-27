@@ -807,6 +807,39 @@ def online_login_page(key: str) -> bytes:
     return doc
 
 
+def _gw_info_html() -> str:
+    """设置页 API 网关卡下方的参考区：完整端点 + 与官方目录同源的模型表。
+    数据与 /v1/models 同一次 /v3/config 获取、同一缓存；目录拉不到时
+    只显示一句话，不拿静态兜底表冒充实时数据。数值均为目录原值。"""
+    ep = ("<p class='small'>完整端点（客户端 Base URL 填第一个）：</p>"
+          "<p><code>https://koi.ipv64.de/v1</code></p>"
+          "<p><code>GET https://koi.ipv64.de/v1/models</code></p>"
+          "<p><code>POST https://koi.ipv64.de/v1/chat/completions</code></p>")
+    rows = None
+    try:
+        rows = gateway.catalog_display(AccountStore())
+    except Exception:  # noqa: BLE001
+        rows = None
+    if not rows:
+        return ("<div class=\"card\"><h2>网关参考</h2>" + ep +
+                "<p class=\"small\">模型目录暂时拉不到</p></div>")
+    trs = []
+    for r in rows:
+        tag = (f" <span class='small'>（{'、'.join(esc(t) for t in r['tags'])}）</span>"
+               if r["tags"] else "")
+        ctx = esc(r["context"]) if r["context"] else "—"
+        out = esc(str(r["max_output"])) if r["max_output"] else "—"
+        cred = esc(str(r["credits"])) if r["credits"] is not None else "—"
+        trs.append(f"<tr><td><code>{esc(r['id'])}</code>{tag}</td>"
+                   f"<td>{ctx}</td><td>{out}</td><td>{cred}</td></tr>")
+    return ("<div class=\"card\"><h2>网关参考（与官方目录一致）</h2>" + ep +
+            "<p class='small'>每次请求按所用模型的积分倍率扣积分，下表「积分倍率」"
+            "即官方目录字段 credits 的原值；标「—」表示官方目录未给该字段"
+            "（如 auto，官方说明为积分倍率随所选模型浮动）。</p>"
+            "<table><tr><th>模型</th><th>上下文</th><th>最大输出</th>"
+            "<th>积分倍率（credits）</th></tr>" + "".join(trs) + "</table></div>")
+
+
 def settings_page(msg: str = "", is_err: bool = False) -> bytes:
     conf = load_conf()
     has_pass = bool(saved_cloud_passphrase(conf))
@@ -833,6 +866,10 @@ async function gwCopy() {{
 </script>"""
         except Exception:  # noqa: BLE001
             gw_html = ""
+        try:
+            gw_html += _gw_info_html()
+        except Exception:  # noqa: BLE001
+            pass
     body = f"""<h1>设置</h1>
 <div class="card"><form method="post" action="/settings">
 <label>网关 endpoint（国内版 https://www.codebuddy.cn；国际版 https://copilot.tencent.com）</label>

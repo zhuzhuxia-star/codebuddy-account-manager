@@ -11,6 +11,9 @@ official-client.md）所记录的官方客户端行为，本模块为 Python 独
   - 上游对话 POST https://www.workbuddy.cn/v2/chat/completions，强制 stream，
     带账号 access token 与官方客户端风格请求头（UA、X-Agent-*、会话三件套等）；
   - 模型目录 GET https://www.workbuddy.cn/v3/config（data.models[]）；
+  - 模型名路由：客户端短名（如 5.3-flash）按目录后缀唯一命中改写为
+    全名（glm-5.3-flash），多义/无命中不改写（上游只认目录全名，
+    短名会回 400 11102 service info not found）；
   - 错误按业务码分类：402/14001 系列=额度不足，12153=会话失效，
     11101/11115/11128=请求本身的问题（不换号），429/14003/6xxx=繁忙换号。
 
@@ -608,8 +611,9 @@ _models_cache: dict = {"at": 0.0, "data": None}
 _models_lock = threading.Lock()
 
 
-def _fetch_catalog(auth: dict, uid: str) -> list[dict] | None:
-    """GET /v3/config 取模型目录（data.models[]）。失败返回 None。"""
+def _fetch_catalog_raw(auth: dict, uid: str) -> list[dict] | None:
+    """GET /v3/config 取官方模型目录原文（data.models[]，不裁剪）。
+    失败返回 None。"""
     headers = {
         "Authorization": f"Bearer {auth.get('accessToken') or ''}",
         "Accept": "application/json",
@@ -624,9 +628,14 @@ def _fetch_catalog(auth: dict, uid: str) -> list[dict] | None:
     models = ((data or {}).get("data") or {}).get("models")
     if not isinstance(models, list):
         return None
+    return [m for m in models if isinstance(m, dict)] or None
+
+
+def _trim_catalog(models: list[dict]) -> list[dict] | None:
+    """把官方目录原文裁成 /v1/models 的 OpenAI 形状（口径与最初版本一致）。"""
     out = []
     for m in models:
-        if not isinstance(m, dict) or not m.get("id"):
+        if not m.get("id"):
             continue
         # 补全类模型（只有 supportsExtra、没有输入上限）不是对话模型，跳过
         if m.get("supportsExtra") and not (m.get("maxInputTokens")
@@ -643,6 +652,18 @@ def _fetch_catalog(auth: dict, uid: str) -> list[dict] | None:
             entry["credits"] = m["credits"]
         out.append(entry)
     return out or None
+
+
+def _fetch_catalog(auth: dict, uid: str) -> list[dict] | None:
+    """GET /v3/config 取模型目录（裁剪版，供 /v1/models）。失败返回 None。
+    成功时把目录原文一并存进共享缓存（_models_cache["raw"]），供设置页
+    参考区同源展示，保证两处看到的是同一次获取的同一份目录。"""
+    models = _fetch_catalog_raw(auth, uid)
+    if models is None:
+        return None
+    with _models_lock:
+        _models_cache.update(raw=models, raw_at=time.time())
+    return _trim_catalog(models)
 
 
 def list_models(store) -> dict:
@@ -679,6 +700,82 @@ def list_models(store) -> dict:
     return data
 
 
+def _display_context(m: dict) -> str | None:
+    """目录原文里的上下文大小，原样呈现：contextWindow 档位字典给
+    「默认（可选 档位…）」，只有 maxInputTokens 就给该值，都没有返回 None。"""
+    cw = m.get("contextWindow")
+    if isinstance(cw, dict) and cw.get("defaultLength"):
+        lengths = cw.get("supportedLengths")
+        if isinstance(lengths, list) and lengths:
+            opts = " / ".join(str(x) for x in lengths)
+            return f"{cw['defaultLength']}（可选 {opts}）"
+        return str(cw["defaultLength"])
+    if m.get("maxInputTokens"):
+        return str(m["maxInputTokens"])
+    return None
+
+
+def catalog_display(store) -> list[dict] | None:
+    """设置页参考区的模型行：与 /v1/models 同源（同一次 /v3/config 获取、
+    同一缓存 _models_cache）。拉不到实时目录返回 None——展示区不拿
+    静态兜底表冒充实时数据。每行 {id, context, max_output, credits, tags}，
+    数值均为官方目录原值，不换算、不取整。"""
+    def _fresh_raw():
+        with _models_lock:
+            raw = _models_cache.get("raw")
+            at = _models_cache.get("raw_at", 0)
+        if raw and time.time() - at < MODELS_CACHE_TTL:
+            return raw
+        return None
+
+    raw = _fresh_raw()
+    if raw is None:
+        list_models(store)  # 触发同源获取；成功时 _fetch_catalog 回填 raw
+        raw = _fresh_raw()
+    if not raw:
+        return None
+    rows = []
+    for m in raw:
+        if not m.get("id"):
+            continue
+        rows.append({
+            "id": str(m["id"]),
+            "context": _display_context(m),
+            "max_output": m.get("maxOutputTokens"),
+            "credits": m.get("credits"),
+            "tags": [str(t) for t in (m.get("tags") or []) if t],
+        })
+    return rows or None
+
+
+# ---------- 模型名路由 ----------
+def _catalog_ids(store) -> list[str]:
+    """当前模型目录的 id 列表：优先上游 /v3/config 目录（list_models
+    内部带缓存），拉不到时 list_models 已回落到静态兜底表。"""
+    try:
+        data = list_models(store)
+        return [str(m["id"]) for m in data.get("data") or [] if m.get("id")]
+    except Exception:  # noqa: BLE001
+        return list(STATIC_MODELS)
+
+
+def _resolve_model(store, requested: str) -> str:
+    """把客户端给的模型名解析成上游目录全名：
+    与目录名完全一致 → 原样；否则按后缀匹配（目录名以 -<请求名> 结尾，
+    即去掉厂商前缀后相等），恰好命中一个才改写；命中多个或零个不改写，
+    原样发上游让它自己报错，不瞎猜。"""
+    if not requested:
+        return requested
+    ids = _catalog_ids(store)
+    if requested in ids:
+        return requested
+    suffix = "-" + requested
+    hits = [mid for mid in ids if mid.endswith(suffix)]
+    if len(hits) == 1:
+        return hits[0]
+    return requested
+
+
 # ---------- 对话主流程 ----------
 def chat(store, body: dict, session_header: str | None) -> Outcome:
     if not isinstance(body, dict):
@@ -688,6 +785,11 @@ def chat(store, body: dict, session_header: str | None) -> Outcome:
     want_stream = bool(body.get("stream"))
     model = str(body.get("model") or "auto")
     payload = _convert_body(body)
+    resolved_model = _resolve_model(store, model)
+    if resolved_model != model:
+        cb_log.log(f"模型 {model} → {resolved_model}", "gateway")
+        model = resolved_model
+        payload["model"] = resolved_model
     skey = _session_key(body, session_header)
     sent = _session_lookup(skey)
 
