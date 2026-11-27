@@ -448,10 +448,13 @@ def esc(s) -> str:
 # 的域名）就用当前 Host；Host 是容器原生地址（*.tryaltare.ai /
 # *.altare.global，带不带端口都算）或 localhost/纯 IP/空/非法等没有
 # 自有域名上下文的情况，一律回落主展示域名 ——设备配置不能绑死在容器
-# 地址上，容器出问题他的域名还能改指向。Handler 在每个请求开头把 Host
-# 记进线程局部，页面函数用 display_base() 取。本站入站不做任何 Host
-# 校验，任何 Host 都正常服务（多域名可用性靠相对跳转 + host-only
-# Cookie）；本节只决定页面上印什么地址，不影响服务行为。
+# 地址上，容器出问题他的域名还能改指向。真实域名取值：Altare 边缘把
+# 请求转进沙盒时很可能改写 Host 为沙盒原生地址、把用户实际访问的域名
+# 放在 X-Forwarded-Host 里，所以先看 X-Forwarded-Host（逗号列表取第一
+# 个）再看 Host，两者都走同一套自有/原生分类。Handler 在每个请求开头
+# 把选出的 Host 记进线程局部，页面函数用 display_base() 取。本站入站
+# 不做任何 Host 校验，任何 Host 都正常服务（多域名可用性靠相对跳转 +
+# host-only Cookie）；本节只决定页面上印什么地址，不影响服务行为。
 _req_ctx = threading.local()
 # 主展示域名：没有自有域名上下文（容器原生地址/localhost/纯 IP/无请求
 # 上下文）时，所有页面展示地址一律用它。
@@ -484,10 +487,21 @@ def _own_display_host(host: str):
 
 
 def set_display_host(host) -> None:
-    """记录当前请求的 Host（Handler 在 do_* 开头调用）；非法/缺失则
-    清空，display_base() 走回落。只影响页面展示，不做放行判断。"""
+    """记录当前请求的展示 Host（Handler 在 do_* 开头调用，值由
+    _request_display_host 选出）；非法/缺失则清空，display_base() 走
+    回落。只影响页面展示，不做放行判断。"""
     host = (host or "").strip()
     _req_ctx.host = host if _HOST_OK.match(host) else None
+
+
+def _request_display_host(headers) -> str:
+    """选当前请求的真实访问域名：优先 X-Forwarded-Host（边缘转发头，
+    逗号分隔取第一个），缺失/为空才用 Host 头。选出的值仍要过
+    set_display_host 的形状净化与 display_base 的自有/原生分类。"""
+    xfh = (headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+    if xfh:
+        return xfh
+    return (headers.get("Host") or "").strip()
 
 
 def display_base() -> str:
@@ -1033,14 +1047,53 @@ async function gwCopy() {{
     return page("设置", body, msg, is_err)
 
 
-def fleet_page() -> bytes:
+def _page_no(v) -> int:
+    try:
+        return max(1, int(v))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _fleet_qs(dpage: int = 1, spage: int = 1, sdev: str = "",
+              sq: str = "") -> str:
+    """拼 /fleet 的查询串：只带非默认参数（页码 >1、筛选非空）。"""
+    parts = []
+    if dpage > 1:
+        parts.append(f"dpage={dpage}")
+    if spage > 1:
+        parts.append(f"spage={spage}")
+    if sdev:
+        parts.append("sdev=" + urllib.parse.quote(sdev, safe=""))
+    if sq:
+        parts.append("sq=" + urllib.parse.quote(sq, safe=""))
+    return ("?" + "&".join(parts)) if parts else ""
+
+
+def _fleet_pager(cur: int, pages: int, total: int, unit: str,
+                 href_of) -> str:
+    info = f"<span class='small'>第 {cur}/{pages} 页 · 共 {total} {unit}</span>"
+    if pages <= 1:
+        return f"<p>{info}</p>"
+    prev = (f"<a class='btn gray' href='{href_of(cur - 1)}'>上一页</a>"
+            if cur > 1 else "")
+    nxt = (f"<a class='btn gray' href='{href_of(cur + 1)}'>下一页</a>"
+           if cur < pages else "")
+    return f"<p>{prev}{nxt} {info}</p>"
+
+
+def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
+               sq: str = "", msg: str = "", is_err: bool = False) -> bytes:
     """第三方设备接入展示页：接入说明（地址+密钥+curl 示例）+ 设备表 +
-    短信表，每 30 秒自动刷新。在线判定：最后心跳在 3 分钟内且最近一次
-    上报 online=true（fleet.list_devices 已算好 online_now）。"""
+    短信表，每 30 秒自动刷新（刷新当前 URL，保留全部查询参数）。
+    设备可编辑手机号/类型/备注；设备表、短信表各自服务端分页
+    （dpage/spage 互不影响）；短信只保留 1 小时、可筛选/复制/删除。
+    在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
+    （fleet 列表函数已算好 online_now）。"""
     if fleet is None:
         return page("设备接入", "<h1>设备接入</h1>"
                                 "<div class='card'>设备接入模块未加载</div>"
-                                "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
+                                "<p><a class='btn gray' href='/'>返回账号列表</a></p>",
+                    msg, is_err)
     base = display_base()
     head = f"""<h1>设备接入</h1>
 <div class="card"><h2>接入说明</h2>
@@ -1057,7 +1110,7 @@ IMEI 即设备身份。页面每 30 秒自动刷新。</p>
 <p class="small">curl 示例（把 &lt;接入密钥&gt; 换成上面的密钥）：</p>
 <pre>curl -X POST {base}/api/v1/heartbeat \\
   -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
-  -d '{{"imei":"860000000000001","phone":"13800000000","online":true,"model":"Pixel 8","battery":85}}'
+  -d '{{"imei":"860000000000001","phone":"13800000000","online":true,"model":"Pixel 8","battery":85,"type":"手机"}}'
 
 curl -X POST {base}/api/v1/sms \\
   -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
@@ -1069,13 +1122,38 @@ async function fleetCopy() {{
   try {{ await navigator.clipboard.writeText(t.value); alert('已复制'); }}
   catch (e) {{ t.select(); document.execCommand('copy'); alert('已复制'); }}
 }}
+function fleetToggleEdit(i) {{
+  const r = document.getElementById('fleet-edit-' + i);
+  if (r) r.style.display = (r.style.display === 'none') ? '' : 'none';
+}}
+async function smsCopy(id) {{
+  const el = document.getElementById('smsc-' + id);
+  const t = el ? el.innerText : '';
+  try {{ await navigator.clipboard.writeText(t); alert('已复制'); }}
+  catch (e) {{
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove(); alert('已复制');
+  }}
+}}
 </script>"""
+
+    per = fleet.PAGE_SIZE
+    back_hidden = (
+        f"<input type='hidden' name='dpage' value='{dpage}'>"
+        f"<input type='hidden' name='spage' value='{spage}'>"
+        f"<input type='hidden' name='sdev' value='{esc(sdev)}'>"
+        f"<input type='hidden' name='sq' value='{esc(sq)}'>")
+
+    # ---------- 设备表（分页 + 行内编辑） ----------
     try:
-        devices = fleet.list_devices()
+        devices, dtotal = fleet.list_devices_page(dpage, per)
     except Exception:  # noqa: BLE001
-        devices = []
+        devices, dtotal = [], 0
+    dpages = max(1, (dtotal + per - 1) // per)
+    dpage = min(max(1, dpage), dpages)
     dtrs = []
-    for d in devices:
+    for i, d in enumerate(devices):
         status = ("<span style='color:#059669'>● 在线</span>" if d["online_now"]
                   else "<span style='color:#9ca3af'>● 离线</span>")
         bat = d.get("battery")
@@ -1086,21 +1164,69 @@ async function fleetCopy() {{
                 bat_s = f"{float(bat):g}%"
             except (TypeError, ValueError):
                 bat_s = esc(bat)
+        imei_q = urllib.parse.quote(d["imei"], safe="")
         dtrs.append(
             f"<tr><td><code>{esc(d['imei'])}</code></td>"
-            f"<td>{esc(d.get('phone') or '—')}</td><td>{status}</td>"
+            f"<td>{esc(d.get('phone') or '—')}</td>"
+            f"<td>{esc(d.get('type') or '—')}</td>"
+            f"<td>{esc(d.get('remark') or '—')}</td>"
+            f"<td>{status}</td>"
             f"<td>{esc(fleet.fmt_ts(d.get('last_seen')))}</td>"
-            f"<td>{esc(d.get('model') or '—')}</td><td>{bat_s}</td></tr>")
+            f"<td>{esc(d.get('model') or '—')}</td><td>{bat_s}</td>"
+            f"<td style='white-space:nowrap'>"
+            f"<button type='button' onclick='fleetToggleEdit({i})'>编辑</button> "
+            f"<a class='btn gray' href='/fleet"
+            f"{_fleet_qs(dpage, 1, d['imei'], '')}#sms'>看短信</a></td></tr>")
+        dtrs.append(
+            f"<tr id='fleet-edit-{i}' style='display:none'>"
+            f"<td colspan='9'>"
+            f"<form method='post' action='/fleet/device/update' class='row'>"
+            f"<input type='hidden' name='imei' value='{esc(d['imei'])}'>"
+            f"{back_hidden}"
+            f"<label>手机号 <input name='phone' style='width:auto' "
+            f"value='{esc(d.get('phone') or '')}'></label>"
+            f"<label>类型 <input name='type' style='width:auto' "
+            f"value='{esc(d.get('type') or '')}' placeholder='如 手机/平板/网关'></label>"
+            f"<label>备注 <input name='remark' style='width:auto' "
+            f"value='{esc(d.get('remark') or '')}'></label>"
+            f"<button type='submit'>保存</button>"
+            f"<button type='button' class='gray' "
+            f"onclick='fleetToggleEdit({i})'>取消</button>"
+            f"</form></td></tr>")
+    dev_pager = _fleet_pager(
+        dpage, dpages, dtotal, "台设备",
+        lambda p: "/fleet" + _fleet_qs(p, spage, sdev, sq))
     dev_html = ("<div class='card'><h2>设备</h2><table>"
-                "<tr><th>IMEI</th><th>手机号</th><th>状态</th>"
-                "<th>最后心跳</th><th>型号</th><th>电量</th></tr>" +
+                "<tr><th>IMEI</th><th>手机号</th><th>类型</th><th>备注</th>"
+                "<th>状态</th><th>最后心跳</th><th>型号</th><th>电量</th>"
+                "<th>操作</th></tr>" +
                 ("".join(dtrs) if dtrs
-                 else "<tr><td colspan='6' class='small'>暂无设备</td></tr>") +
-                "</table></div>")
+                 else "<tr><td colspan='9' class='small'>暂无设备</td></tr>") +
+                "</table>" + dev_pager + "</div>")
+
+    # ---------- 短信表（分页 + 筛选 + 复制/删除） ----------
     try:
-        msgs = fleet.list_sms(200)
+        all_devices = fleet.list_devices()
     except Exception:  # noqa: BLE001
-        msgs = []
+        all_devices = []
+    dev_opts = ["<option value=''>全部设备</option>"]
+    seen_imei = set()
+    for d in all_devices:
+        seen_imei.add(d["imei"])
+        sel = " selected" if d["imei"] == sdev else ""
+        label = d.get("phone") or d["imei"]
+        dev_opts.append(f"<option value='{esc(d['imei'])}'{sel}>"
+                        f"{esc(label)}</option>")
+    if sdev and sdev not in seen_imei:
+        dev_opts.append(f"<option value='{esc(sdev)}' selected>"
+                        f"{esc(sdev)}</option>")
+    try:
+        msgs, stotal = fleet.list_sms_page(spage, per, sdev or None,
+                                           sq or None)
+    except Exception:  # noqa: BLE001
+        msgs, stotal = [], 0
+    spages = max(1, (stotal + per - 1) // per)
+    spage = min(max(1, spage), spages)
     strs_ = []
     for m in msgs:
         dev = m.get("phone") or m["imei"]
@@ -1108,20 +1234,47 @@ async function fleetCopy() {{
             f"<tr><td style='white-space:nowrap'>"
             f"{esc(fleet.fmt_ts(m.get('received_at')))}</td>"
             f"<td>{esc(dev)}</td><td>{esc(m.get('sender') or '—')}</td>"
-            f"<td style='word-break:break-all'>{esc(m.get('content') or '')}"
+            f"<td id='smsc-{m['id']}' "
+            f"style='white-space:pre-wrap;word-break:break-word'>"
+            f"{esc(m.get('content') or '')}</td>"
+            f"<td style='white-space:nowrap'>"
+            f"<button type='button' onclick='smsCopy({m['id']})'>复制</button> "
+            f"<form method='post' action='/fleet/sms/delete' class='inline' "
+            f"onsubmit=\"return confirm('确定删除这条短信？')\">"
+            f"<input type='hidden' name='id' value='{m['id']}'>"
+            f"{back_hidden}"
+            f"<button type='submit' class='red'>删除</button></form>"
             f"</td></tr>")
-    sms_html = ("<div class='card'><h2>短信（最新在前，最多 200 条）</h2>"
-                "<table><tr><th>时间</th><th>设备</th><th>发送方</th>"
-                "<th>内容</th></tr>" +
-                ("".join(strs_) if strs_
-                 else "<tr><td colspan='4' class='small'>暂无短信</td></tr>") +
-                "</table></div>")
+    sms_pager = _fleet_pager(
+        spage, spages, stotal, "条短信",
+        lambda p: "/fleet" + _fleet_qs(dpage, p, sdev, sq) + "#sms")
+    clear_link = (f" <a class='btn gray' href='/fleet"
+                  f"{_fleet_qs(dpage, 1, '', '')}#sms'>清除筛选</a>"
+                  if (sdev or sq) else "")
+    sms_html = (
+        "<div class='card' id='sms'><h2>短信</h2>"
+        "<p class='small'>短信保留 1 小时，过期自动删除。</p>"
+        "<form method='get' action='/fleet' class='row'>"
+        f"<input type='hidden' name='dpage' value='{dpage}'>"
+        f"<label>设备 <select name='sdev' style='width:auto'>"
+        f"{''.join(dev_opts)}</select></label>"
+        f"<label>关键词 <input name='sq' style='width:auto' "
+        f"value='{esc(sq)}' placeholder='内容 / 发送方'></label>"
+        f"<button type='submit'>筛选</button>{clear_link}</form>"
+        "<form method='post' action='/fleet/sms/clear' class='inline' "
+        "onsubmit=\"return confirm('确定清空全部短信？')\">"
+        f"{back_hidden}"
+        "<button type='submit' class='red'>清空全部短信</button></form>"
+        "<table><tr><th>时间</th><th>设备</th><th>发送方</th>"
+        "<th>内容</th><th>操作</th></tr>" +
+        ("".join(strs_) if strs_
+         else "<tr><td colspan='5' class='small'>暂无短信</td></tr>") +
+        "</table>" + sms_pager + "</div>")
     body = (head + dev_html + sms_html +
             "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
-    doc = page("设备接入", body)
+    doc = page("设备接入", body, msg, is_err)
     return doc.replace(b"<title>",
                         b"<meta http-equiv='refresh' content='30'><title>", 1)
-
 
 def logs_page() -> bytes:
     lines = cb_log.tail(300)
@@ -1984,7 +2137,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         """短链的 HEAD 探测（播放器开播前常先发）：只回头、不回体。"""
-        set_display_host(self.headers.get("Host"))
+        set_display_host(_request_display_host(self.headers))
         u = urllib.parse.urlparse(self.path)
         if u.path in FAVICONS:
             return self._serve_favicon(u.path, head_only=True)
@@ -2013,7 +2166,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 路由 --
     def do_GET(self):
-        set_display_host(self.headers.get("Host"))
+        set_display_host(_request_display_host(self.headers))
         u = urllib.parse.urlparse(self.path)
         if u.path == "/v1/models":
             return self._v1_models()
@@ -2054,7 +2207,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/oos":
             return self._send(200, oos_page(msg, is_err))
         if u.path == "/fleet":
-            return self._send(200, fleet_page())
+            return self._send(200, fleet_page(
+                _page_no(q.get("dpage")), _page_no(q.get("spage")),
+                q.get("sdev", ""), q.get("sq", ""), msg, is_err))
         if u.path == "/oos/get":
             key = q.get("key", "")
             if not key:
@@ -2091,7 +2246,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, page("404", "<h1>页面不存在</h1>"))
 
     def do_POST(self):
-        set_display_host(self.headers.get("Host"))
+        set_display_host(_request_display_host(self.headers))
         u = urllib.parse.urlparse(self.path)
         if u.path == "/v1/chat/completions":
             return self._v1_chat()
@@ -2186,6 +2341,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect(
                 "/", f"「{rec.get('label') or ''}」已"
                      f"{'加入' if rec['in_pool'] else '移出'}网关池")
+        if u.path == "/fleet/device/update":
+            ok = bool(fleet) and fleet.update_device(
+                form.get("imei", ""), form.get("phone", ""),
+                form.get("type", ""), form.get("remark", ""))
+            back = "/fleet" + _fleet_qs(
+                _page_no(form.get("dpage")), _page_no(form.get("spage")),
+                form.get("sdev", ""), form.get("sq", ""))
+            return self._redirect(back, "设备已更新" if ok else "设备不存在",
+                                  not ok)
+        if u.path == "/fleet/sms/delete":
+            ok = bool(fleet) and fleet.delete_sms(form.get("id", ""))
+            back = "/fleet" + _fleet_qs(
+                _page_no(form.get("dpage")), _page_no(form.get("spage")),
+                form.get("sdev", ""), form.get("sq", ""))
+            return self._redirect(back, "短信已删除" if ok else "短信不存在",
+                                  not ok)
+        if u.path == "/fleet/sms/clear":
+            n = fleet.clear_sms() if fleet else 0
+            back = "/fleet" + _fleet_qs(
+                _page_no(form.get("dpage")), 1,
+                form.get("sdev", ""), form.get("sq", ""))
+            return self._redirect(back, f"已清空 {n} 条短信")
         if u.path == "/oos/delete":
             cli = u3_client()
             key = form.get("key", "")

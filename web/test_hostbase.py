@@ -330,6 +330,33 @@ check("IPv6 Host 回落主展示域名",
       server.display_base())
 server.set_display_host(None)
 
+# ---------- [4] X-Forwarded-Host 优先（边缘转发头才是真实域名） ----------
+print("[4] X-Forwarded-Host 优先于 Host")
+check("XFH 优先（直调）", server._request_display_host(
+    {"X-Forwarded-Host": "sms.dcio.eu.org",
+     "Host": "se-sto11.tryaltare.ai:25536"}) == "sms.dcio.eu.org")
+check("XFH 逗号列表取第一个", server._request_display_host(
+    {"X-Forwarded-Host": "sms.dcio.eu.org, proxy.internal",
+     "Host": "koi.ipv64.de"}) == "sms.dcio.eu.org")
+check("无 XFH 用 Host", server._request_display_host(
+    {"Host": "koi.ipv64.de"}) == "koi.ipv64.de")
+check("XFH 为空用 Host", server._request_display_host(
+    {"X-Forwarded-Host": "  ", "Host": "koi.ipv64.de"}) == "koi.ipv64.de")
+
+st, _, html = req("GET", "/fleet", headers={
+    "Cookie": sess, "Host": HOST_B, "X-Forwarded-Host": HOST_SMS})
+check("[XFH] 容器 Host + XFH=sms → fleet 展示 sms",
+      f"POST https://{HOST_SMS}/api/v1/heartbeat" in html)
+st, _, html = req("GET", "/fleet", headers={
+    "Cookie": sess, "Host": HOST_SMS, "X-Forwarded-Host": HOST_B})
+check("[XFH] XFH 为容器原生 → 回落主展示域名",
+      f"POST https://{KOI}/api/v1/heartbeat" in html
+      and "tryaltare" not in html)
+st, _, html = req("GET", "/settings", headers={
+    "Cookie": sess, "Host": HOST_A, "X-Forwarded-Host": HOST_SMS})
+check("[XFH] XFH 优先于自有 Host（设置页）",
+      f"<code>https://{HOST_SMS}/v1</code>" in html)
+
 srv.shutdown()
 print(f"\n== hostbase: {PASS} passed, {FAIL} failed ==")
 sys.exit(1 if FAIL else 0)

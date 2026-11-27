@@ -6,8 +6,10 @@
     服务端与管理页出现），服务端另存 sha256 哈希校验。请求带
     X-Device-Key 头，或 Authorization: Bearer <key>。
   - IMEI 即设备身份（本轮不做逐设备密钥）。
-  - 存储 DATA_DIR/fleet.db（SQLite）：devices / sms 两张表，
-    本轮不做自动清理。
+  - 存储 DATA_DIR/fleet.db（SQLite）：devices / sms 两张表。
+  - 短信只保留 SMS_TTL 秒（1 小时）：读列表与新短信入库时顺带清理
+    过期短信，管理页也可手动删单条 / 清空全部。
+  - 设备可由管理页编辑手机号 / 类型 / 备注（type 也可随心跳上报）。
 
 在线判定：last_seen 在 ONLINE_WINDOW 秒内且最近一次上报 online=true。
 """
@@ -28,6 +30,8 @@ KEY_FILE = DATA_DIR / "fleet.json"
 DB_FILE = DATA_DIR / "fleet.db"
 
 ONLINE_WINDOW = 180  # 秒：最后心跳在此窗口内且上报在线才算在线
+SMS_TTL = 3600  # 秒：短信只保留 1 小时，过期自动清理
+PAGE_SIZE = 20  # 管理页设备表 / 短信表每页条数
 
 # ---------- 接入密钥 ----------
 _key_lock = threading.Lock()
@@ -104,6 +108,12 @@ def _db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS devices("
         "imei TEXT PRIMARY KEY, phone TEXT, online_reported INTEGER DEFAULT 0,"
         "last_seen REAL, model TEXT, battery TEXT, app_version TEXT)")
+    # 迁移：老库补 type（设备类型）/ remark（备注）两列，已有数据不动。
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
+    if "type" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN type TEXT")
+    if "remark" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN remark TEXT")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sms("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, imei TEXT NOT NULL,"
@@ -190,18 +200,20 @@ def heartbeat(body: dict):
         try:
             conn.execute(
                 "INSERT INTO devices(imei, phone, online_reported, last_seen,"
-                " model, battery, app_version) VALUES(?,?,?,?,?,?,?)"
+                " model, battery, app_version, type) VALUES(?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(imei) DO UPDATE SET"
                 " phone=COALESCE(excluded.phone, devices.phone),"
                 " online_reported=excluded.online_reported,"
                 " last_seen=excluded.last_seen,"
                 " model=COALESCE(excluded.model, devices.model),"
                 " battery=COALESCE(excluded.battery, devices.battery),"
-                " app_version=COALESCE(excluded.app_version, devices.app_version)",
+                " app_version=COALESCE(excluded.app_version,"
+                " devices.app_version),"
+                " type=COALESCE(excluded.type, devices.type)",
                 (imei, _opt_str(body, "phone"),
                  1 if _parse_online(body) else 0, now,
                  _opt_str(body, "model"), battery_s,
-                 _opt_str(body, "app_version")))
+                 _opt_str(body, "app_version"), _opt_str(body, "type")))
             conn.commit()
         finally:
             conn.close()
@@ -230,6 +242,8 @@ def record_sms(body: dict):
                 "INSERT INTO sms(imei, sender, content, device_ts, received_at)"
                 " VALUES(?,?,?,?,?)",
                 (imei, _opt_str(body, "from"), content, device_ts, now))
+            conn.execute("DELETE FROM sms WHERE received_at < ?",
+                         (now - SMS_TTL,))
             conn.commit()
             rid = cur.lastrowid
         finally:
@@ -238,6 +252,14 @@ def record_sms(body: dict):
 
 
 # ---------- 展示数据 ----------
+def _device_out(r, now: float) -> dict:
+    d = dict(r)
+    d["online_now"] = bool(
+        d.get("last_seen") and (now - float(d["last_seen"])) <= ONLINE_WINDOW
+        and d.get("online_reported"))
+    return d
+
+
 def list_devices(now: float | None = None) -> list[dict]:
     now = time.time() if now is None else now
     conn = _db()
@@ -247,17 +269,68 @@ def list_devices(now: float | None = None) -> list[dict]:
         ).fetchall()
     finally:
         conn.close()
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["online_now"] = bool(
-            d.get("last_seen") and (now - float(d["last_seen"])) <= ONLINE_WINDOW
-            and d.get("online_reported"))
-        out.append(d)
-    return out
+    return [_device_out(r, now) for r in rows]
+
+
+def list_devices_page(page: int = 1, per_page: int = PAGE_SIZE,
+                      now: float | None = None):
+    """设备分页：返回 (本页设备列表, 总数)。页码越界自动夹到有效范围。"""
+    now = time.time() if now is None else now
+    conn = _db()
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = min(max(1, int(page or 1)), pages)
+        rows = conn.execute(
+            "SELECT * FROM devices ORDER BY (last_seen IS NULL),"
+            " last_seen DESC LIMIT ? OFFSET ?",
+            (per_page, (page - 1) * per_page)).fetchall()
+    finally:
+        conn.close()
+    return [_device_out(r, now) for r in rows], total
+
+
+def update_device(imei: str, phone, type_, remark) -> bool:
+    """管理页编辑设备：手机号 / 类型 / 备注（IMEI 是身份不可改）。
+    空字符串视为清空（存 NULL）；设备不存在返回 False。"""
+    imei = (imei or "").strip()
+    if not imei:
+        return False
+
+    def _norm(v):
+        if v is None:
+            return None
+        v = str(v).strip()
+        return v or None
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute(
+                "UPDATE devices SET phone=?, type=?, remark=? WHERE imei=?",
+                (_norm(phone), _norm(type_), _norm(remark), imei))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def purge_old_sms(now: float | None = None) -> int:
+    """清掉超过 SMS_TTL 的短信，返回清掉条数。"""
+    now = time.time() if now is None else now
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute("DELETE FROM sms WHERE received_at < ?",
+                               (now - SMS_TTL,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
 
 
 def list_sms(limit: int = 200) -> list[dict]:
+    purge_old_sms()
     conn = _db()
     try:
         rows = conn.execute(
@@ -267,3 +340,59 @@ def list_sms(limit: int = 200) -> list[dict]:
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+def list_sms_page(page: int = 1, per_page: int = PAGE_SIZE,
+                  imei: str | None = None, keyword: str | None = None):
+    """短信分页 + 筛选：imei 精确筛设备，keyword 子串匹配内容/发送方。
+    返回 (本页短信列表, 总数)；读前先清过期短信。"""
+    purge_old_sms()
+    where, args = [], []
+    if imei:
+        where.append("s.imei = ?")
+        args.append(imei)
+    if keyword:
+        where.append("(s.content LIKE ? OR s.sender LIKE ?)")
+        like = f"%{keyword}%"
+        args += [like, like]
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    conn = _db()
+    try:
+        total = conn.execute(f"SELECT COUNT(*) FROM sms s{wsql}",
+                             args).fetchone()[0]
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = min(max(1, int(page or 1)), pages)
+        rows = conn.execute(
+            "SELECT s.*, d.phone AS phone FROM sms s"
+            " LEFT JOIN devices d ON d.imei = s.imei"
+            f"{wsql} ORDER BY s.id DESC LIMIT ? OFFSET ?",
+            args + [per_page, (page - 1) * per_page]).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows], total
+
+
+def delete_sms(sid) -> bool:
+    try:
+        sid = int(sid)
+    except (TypeError, ValueError):
+        return False
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute("DELETE FROM sms WHERE id=?", (sid,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def clear_sms() -> int:
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute("DELETE FROM sms")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
