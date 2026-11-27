@@ -1113,95 +1113,26 @@ def _fleet_pager(cur: int, pages: int, total: int, unit: str,
     return f"<p>{prev}{nxt} {info}</p>"
 
 
-def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
-               sq: str = "", msg: str = "", is_err: bool = False,
-               dsort: str = "", dorder: str = "",
-               ssort: str = "", sorder: str = "") -> bytes:
-    """第三方设备接入展示页：接入说明（地址+密钥+curl 示例）+ 设备表 +
-    短信表，每 30 秒自动刷新（刷新当前 URL，保留全部查询参数）。
-    接入密钥可在本页自定义设置或随机更换（换后旧密钥立即失效）；
-    设备可编辑手机号/类型/备注，在线设备显示在线时长；设备表、短信表
-    各自服务端分页（dpage/spage 互不影响）；两表可排序列的表头各
-    常驻一对 ▲▼ 小箭头点排序（列名本身不可点；服务端排序
-    dsort/dorder、ssort/sorder，当前方向箭头高亮，与分页/筛选共存）；
-    短信只保留 1 小时、可筛选/复制/删除，时间分上传时间（服务器收到）
-    与短信时间（设备上报）两列。
-    在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
-    （fleet 列表函数已算好 online_now）。"""
-    if fleet is None:
-        return page("设备接入", "<h1>设备接入</h1>"
-                                "<div class='card'>设备接入模块未加载</div>"
-                                "<p><a class='btn gray' href='/'>返回账号列表</a></p>",
-                    msg, is_err)
+def _fleet_norm(dsort: str, dorder: str, ssort: str,
+                sorder: str) -> tuple[str, str, str, str]:
+    """排序参数归一化（/fleet 与 /fleet/partial 共用）：非法列回默认
+    列（设备最后心跳 / 短信上传时间），方向非 asc 一律 desc。"""
     if dsort not in ("phone", "type", "status", "duration", "last_seen"):
         dsort = "last_seen"
     dorder = "asc" if dorder == "asc" else "desc"
     if ssort not in ("received", "device_ts", "device", "sender"):
         ssort = "received"
     sorder = "asc" if sorder == "asc" else "desc"
-    base = display_base()
-    head = f"""<h1>设备接入</h1>
-<div class="card"><h2>接入说明</h2>
-<p class="small">第三方设备用下面的接入密钥调用两个接口（请求头
-<code>X-Device-Key</code>，或 <code>Authorization: Bearer</code>），
-IMEI 即设备身份。页面每 30 秒自动刷新。</p>
-<p>心跳：<code>POST {base}/api/v1/heartbeat</code></p>
-<p>短信上报：<code>POST {base}/api/v1/sms</code></p>
-<label>接入密钥（掩码）</label>
-<input value="{esc(fleet.key_masked())}" readonly>
-<label>接入密钥（明文，仅本管理页可见，别外传）</label>
-<textarea id="fleetkey" rows="2" readonly>{esc(fleet.key_plain())}</textarea>
-<button type="button" onclick="fleetCopy()">复制密钥</button>
-<p class="small">换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报。</p>
-<form method="post" action="/fleet/key/update" class="row"
- onsubmit="return confirm('换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报，确定继续？')">
-<input type="hidden" name="dpage" value="{dpage}">
-<input type="hidden" name="spage" value="{spage}">
-<input type="hidden" name="sdev" value="{esc(sdev)}">
-<input type="hidden" name="sq" value="{esc(sq)}">
-<label>自定义新密钥 <input name="new_key" style="width:auto"
- placeholder="至少 8 位，字母数字与常见符号"></label>
-<button type="submit">保存新密钥</button>
-</form>
-<form method="post" action="/fleet/key/rotate" class="inline"
- onsubmit="return confirm('换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报，确定继续？')">
-<input type="hidden" name="dpage" value="{dpage}">
-<input type="hidden" name="spage" value="{spage}">
-<input type="hidden" name="sdev" value="{esc(sdev)}">
-<input type="hidden" name="sq" value="{esc(sq)}">
-<button type="submit" class="gray">随机换一把</button>
-</form>
-<p class="small">curl 示例（把 &lt;接入密钥&gt; 换成上面的密钥）：</p>
-<pre>curl -X POST {base}/api/v1/heartbeat \\
-  -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
-  -d '{{"imei":"860000000000001","phone":"13800000000","online":true,"model":"Pixel 8","battery":85,"type":"手机"}}'
+    return dsort, dorder, ssort, sorder
 
-curl -X POST {base}/api/v1/sms \\
-  -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
-  -d '{{"imei":"860000000000001","from":"10086","content":"短信内容","ts":1764000000000}}'</pre>
-</div>
-<script>
-async function fleetCopy() {{
-  const t = document.getElementById('fleetkey');
-  try {{ await navigator.clipboard.writeText(t.value); alert('已复制'); }}
-  catch (e) {{ t.select(); document.execCommand('copy'); alert('已复制'); }}
-}}
-function fleetToggleEdit(i) {{
-  const r = document.getElementById('fleet-edit-' + i);
-  if (r) r.style.display = (r.style.display === 'none') ? '' : 'none';
-}}
-async function smsCopy(id) {{
-  const el = document.getElementById('smsc-' + id);
-  const t = el ? el.innerText : '';
-  try {{ await navigator.clipboard.writeText(t); alert('已复制'); }}
-  catch (e) {{
-    const ta = document.createElement('textarea');
-    ta.value = t; document.body.appendChild(ta); ta.select();
-    document.execCommand('copy'); ta.remove(); alert('已复制');
-  }}
-}}
-</script>"""
 
+def _fleet_tables(dpage: int, spage: int, sdev: str, sq: str,
+                  dsort: str, dorder: str, ssort: str,
+                  sorder: str) -> tuple[str, str]:
+    """渲染设备表区 + 短信表区的内容片段（不含 card 外壳与标题）：
+    /fleet 整页与 /fleet/partial 局部更新共用同一套渲染，保证两处
+    口径一致。入参须已过 _fleet_norm 归一化。返回
+    (设备表+分页器, 短信规则说明+筛选/清空表单+短信表+分页器)。"""
     per = fleet.PAGE_SIZE
     back_hidden = (
         f"<input type='hidden' name='dpage' value='{dpage}'>"
@@ -1280,7 +1211,7 @@ async function smsCopy(id) {{
         dpage, dpages, dtotal, "台设备",
         lambda p: "/fleet" + _fleet_qs(p, spage, sdev, sq,
                                        dsort, dorder, ssort, sorder))
-    dev_html = ("<div class='card'><h2>设备</h2><table>"
+    dev_inner = ("<table>"
                 "<tr><th>IMEI</th>"
                 + dev_th("手机号", "phone") + dev_th("类型", "type")
                 + "<th>备注</th>" + dev_th("状态", "status")
@@ -1289,7 +1220,7 @@ async function smsCopy(id) {{
                 + "<th>型号</th><th>电量</th><th>操作</th></tr>" +
                 ("".join(dtrs) if dtrs
                  else "<tr><td colspan='10' class='small'>暂无设备</td></tr>") +
-                "</table>" + dev_pager + "</div>")
+                "</table>" + dev_pager)
 
     # ---------- 短信表（分页 + 筛选 + 复制/删除） ----------
     try:
@@ -1342,8 +1273,7 @@ async function smsCopy(id) {{
     clear_link = (f" <a class='btn gray' href='/fleet"
                   f"{_fleet_qs(dpage, 1, '', '', dsort, dorder, ssort, sorder)}#sms'>清除筛选</a>"
                   if (sdev or sq) else "")
-    sms_html = (
-        "<div class='card' id='sms'><h2>短信</h2>"
+    sms_inner = (
         "<p class='small'>短信保留 1 小时，过期自动删除。上传时间 = 服务器"
         "收到短信的时间，短信时间 = 设备上报的短信时间。</p>"
         "<form method='get' action='/fleet' class='row'>"
@@ -1367,12 +1297,160 @@ async function smsCopy(id) {{
         + "<th>内容</th><th>操作</th></tr>" +
         ("".join(strs_) if strs_
          else "<tr><td colspan='6' class='small'>暂无短信</td></tr>") +
-        "</table>" + sms_pager + "</div>")
-    body = (head + dev_html + sms_html +
-            "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
-    doc = page("设备接入", body, msg, is_err)
-    return doc.replace(b"<title>",
-                        b"<meta http-equiv='refresh' content='30'><title>", 1)
+        "</table>" + sms_pager)
+    return dev_inner, sms_inner
+
+
+def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
+               sq: str = "", msg: str = "", is_err: bool = False,
+               dsort: str = "", dorder: str = "",
+               ssort: str = "", sorder: str = "") -> bytes:
+    """第三方设备接入展示页：接入说明（地址+密钥+curl 示例）+ 设备表 +
+    短信表，页面每 30 秒经 /fleet/partial 局部更新两表数据（不整页
+    刷新、不丢滚动位置；编辑表单展开/焦点在输入控件/有选中文本/最近
+    10 秒有点击或滚动/标签页不可见时跳过本轮更新）。
+    接入密钥可在本页自定义设置或随机更换（换后旧密钥立即失效）；
+    设备可编辑手机号/类型/备注，在线设备显示在线时长；设备表、短信表
+    各自服务端分页（dpage/spage 互不影响）；两表可排序列的表头各
+    常驻一对 ▲▼ 小箭头点排序（列名本身不可点；服务端排序
+    dsort/dorder、ssort/sorder，当前方向箭头高亮，与分页/筛选共存）；
+    短信只保留 1 小时、可筛选/复制/删除，时间分上传时间（服务器收到）
+    与短信时间（设备上报）两列。
+    在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
+    （fleet 列表函数已算好 online_now）。"""
+    if fleet is None:
+        return page("设备接入", "<h1>设备接入</h1>"
+                                "<div class='card'>设备接入模块未加载</div>"
+                                "<p><a class='btn gray' href='/'>返回账号列表</a></p>",
+                    msg, is_err)
+    dsort, dorder, ssort, sorder = _fleet_norm(dsort, dorder, ssort, sorder)
+    base = display_base()
+    head = f"""<h1>设备接入</h1>
+<div class="card"><h2>接入说明</h2>
+<p class="small">第三方设备用下面的接入密钥调用两个接口（请求头
+<code>X-Device-Key</code>，或 <code>Authorization: Bearer</code>），
+IMEI 即设备身份。页面每 30 秒局部更新设备与短信数据（不整页刷新）。</p>
+<p>心跳：<code>POST {base}/api/v1/heartbeat</code></p>
+<p>短信上报：<code>POST {base}/api/v1/sms</code></p>
+<label>接入密钥（掩码）</label>
+<input value="{esc(fleet.key_masked())}" readonly>
+<label>接入密钥（明文，仅本管理页可见，别外传）</label>
+<textarea id="fleetkey" rows="2" readonly>{esc(fleet.key_plain())}</textarea>
+<button type="button" onclick="fleetCopy()">复制密钥</button>
+<p class="small">换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报。</p>
+<form method="post" action="/fleet/key/update" class="row"
+ onsubmit="return confirm('换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报，确定继续？')">
+<input type="hidden" name="dpage" value="{dpage}">
+<input type="hidden" name="spage" value="{spage}">
+<input type="hidden" name="sdev" value="{esc(sdev)}">
+<input type="hidden" name="sq" value="{esc(sq)}">
+<label>自定义新密钥 <input name="new_key" style="width:auto"
+ placeholder="至少 8 位，字母数字与常见符号"></label>
+<button type="submit">保存新密钥</button>
+</form>
+<form method="post" action="/fleet/key/rotate" class="inline"
+ onsubmit="return confirm('换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报，确定继续？')">
+<input type="hidden" name="dpage" value="{dpage}">
+<input type="hidden" name="spage" value="{spage}">
+<input type="hidden" name="sdev" value="{esc(sdev)}">
+<input type="hidden" name="sq" value="{esc(sq)}">
+<button type="submit" class="gray">随机换一把</button>
+</form>
+<p class="small">curl 示例（把 &lt;接入密钥&gt; 换成上面的密钥）：</p>
+<pre>curl -X POST {base}/api/v1/heartbeat \\
+  -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
+  -d '{{"imei":"860000000000001","phone":"13800000000","online":true,"model":"Pixel 8","battery":85,"type":"手机"}}'
+
+curl -X POST {base}/api/v1/sms \\
+  -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
+  -d '{{"imei":"860000000000001","from":"10086","content":"短信内容","ts":1764000000000}}'</pre>
+</div>
+<script>
+async function fleetCopy() {{
+  const t = document.getElementById('fleetkey');
+  try {{ await navigator.clipboard.writeText(t.value); alert('已复制'); }}
+  catch (e) {{ t.select(); document.execCommand('copy'); alert('已复制'); }}
+}}
+function fleetToggleEdit(i) {{
+  const r = document.getElementById('fleet-edit-' + i);
+  if (r) r.style.display = (r.style.display === 'none') ? '' : 'none';
+}}
+async function smsCopy(id) {{
+  const el = document.getElementById('smsc-' + id);
+  const t = el ? el.innerText : '';
+  try {{ await navigator.clipboard.writeText(t); alert('已复制'); }}
+  catch (e) {{
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove(); alert('已复制');
+  }}
+}}
+let fleetLastAct = Date.now();
+document.addEventListener('click',
+  function() {{ fleetLastAct = Date.now(); }}, true);
+window.addEventListener('scroll',
+  function() {{ fleetLastAct = Date.now(); }}, true);
+function fleetShouldSkip(doc, win, now, lastAct) {{
+  // 局部更新护栏：命中任一就跳过本轮（不报错、不堆积重试）。
+  if (doc.hidden) return true;
+  const ae = doc.activeElement;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' ||
+             ae.tagName === 'SELECT')) return true;
+  const sel = win.getSelection ? win.getSelection() : null;
+  if (sel && !sel.isCollapsed && String(sel).length > 0) return true;
+  const rows = doc.querySelectorAll("tr[id^='fleet-edit-']");
+  for (let i = 0; i < rows.length; i++) {{
+    if (rows[i].style.display !== 'none') return true;
+  }}
+  if (now - lastAct < 10000) return true;
+  return false;
+}}
+async function fleetTick() {{
+  if (fleetShouldSkip(document, window, Date.now(), fleetLastAct)) return;
+  try {{
+    const r = await fetch('/fleet/partial' + window.location.search,
+                          {{headers: {{'Accept': 'application/json'}}}});
+    if (!r.ok) return;
+    const d = await r.json();
+    if (fleetShouldSkip(document, window, Date.now(), fleetLastAct)) return;
+    const dv = document.getElementById('fleet-dev-body');
+    const sm = document.getElementById('fleet-sms-body');
+    if (dv) dv.innerHTML = d.dev;
+    if (sm) sm.innerHTML = d.sms;
+    const u1 = document.getElementById('fleet-upd-dev');
+    const u2 = document.getElementById('fleet-upd-sms');
+    if (u1) u1.textContent = '最后更新 ' + d.time;
+    if (u2) u2.textContent = '最后更新 ' + d.time;
+  }} catch (e) {{}}
+}}
+setInterval(fleetTick, 30000);
+</script>"""
+
+    dev_inner, sms_inner = _fleet_tables(
+        dpage, spage, sdev, sq, dsort, dorder, ssort, sorder)
+    body = (head
+            + "<div class='card'><h2>设备 "
+              "<span class='small' id='fleet-upd-dev'></span></h2>"
+              "<div id='fleet-dev-body'>" + dev_inner + "</div></div>"
+            + "<div class='card' id='sms'><h2>短信 "
+              "<span class='small' id='fleet-upd-sms'></span></h2>"
+              "<div id='fleet-sms-body'>" + sms_inner + "</div></div>"
+            + "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
+    return page("设备接入", body, msg, is_err)
+
+
+def fleet_partial(dpage: int = 1, spage: int = 1, sdev: str = "",
+                  sq: str = "", dsort: str = "", dorder: str = "",
+                  ssort: str = "", sorder: str = "") -> dict:
+    """GET /fleet/partial 的数据：与 /fleet 相同查询参数，返回设备
+    表区、短信表区两块 HTML 片段 + 服务器时间（HH:MM:SS），供页面
+    每 30 秒局部更新（整页不重载）。渲染与整页共用 _fleet_tables。"""
+    dsort, dorder, ssort, sorder = _fleet_norm(dsort, dorder, ssort, sorder)
+    dev_inner, sms_inner = _fleet_tables(dpage, spage, sdev, sq,
+                                         dsort, dorder, ssort, sorder)
+    return {"dev": dev_inner, "sms": sms_inner,
+            "time": time.strftime("%H:%M:%S")}
+
 
 def logs_page() -> bytes:
     lines = cb_log.tail(300)
@@ -2308,6 +2386,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, fleet_page(
                 _page_no(q.get("dpage")), _page_no(q.get("spage")),
                 q.get("sdev", ""), q.get("sq", ""), msg, is_err,
+                q.get("dsort", ""), q.get("dorder", ""),
+                q.get("ssort", ""), q.get("sorder", "")))
+        if u.path == "/fleet/partial":
+            if fleet is None:
+                return self._send_json(503, {"error": "设备接入模块未加载"})
+            return self._send_json(200, fleet_partial(
+                _page_no(q.get("dpage")), _page_no(q.get("spage")),
+                q.get("sdev", ""), q.get("sq", ""),
                 q.get("dsort", ""), q.get("dorder", ""),
                 q.get("ssort", ""), q.get("sorder", "")))
         if u.path == "/oos/get":

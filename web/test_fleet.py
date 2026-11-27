@@ -184,7 +184,15 @@ check("页含接口完整地址", "/api/v1/heartbeat" in htmltxt
 check("页含掩码密钥与明文", fleet.key_masked() in htmltxt
       and FAKE_KEY in htmltxt)
 check("页含 curl 示例", "curl -X POST" in htmltxt)
-check("页含 30 秒自动刷新", "http-equiv='refresh' content='30'" in htmltxt)
+check("页无整页自动刷新 meta", "http-equiv='refresh'" not in htmltxt)
+check("页含局部更新端点与定时器",
+      "/fleet/partial" in htmltxt
+      and "setInterval(fleetTick, 30000)" in htmltxt)
+check("页含护栏函数与两区容器/更新标记",
+      "fleetShouldSkip" in htmltxt and "id='fleet-dev-body'" in htmltxt
+      and "id='fleet-sms-body'" in htmltxt
+      and "id='fleet-upd-dev'" in htmltxt
+      and "id='fleet-upd-sms'" in htmltxt)
 check("设备行渲染", IMEI in htmltxt and "13800000000" in htmltxt
       and "Pixel 8" in htmltxt and "85%" in htmltxt)
 check("短信行渲染", "您的验证码是 123456" in htmltxt and "10086" in htmltxt)
@@ -309,7 +317,7 @@ check("短信翻到第 3/3 页", "第 3/3 页" in htmltxt)
 check("短信第三页 6 条", htmltxt.count("smsCopy(") - 1 == 6,
       str(htmltxt.count("smsCopy(")))
 check("翻短信页不影响设备页", "第 1/2 页" in htmltxt)
-check("带参页仍有自动刷新", "http-equiv='refresh' content='30'" in htmltxt)
+check("带参页无整页刷新", "http-equiv='refresh'" not in htmltxt)
 
 st, _, htmltxt = req("GET", "/fleet?dpage=2", headers={"Cookie": sess})
 check("设备翻到第 2/2 页", "第 2/2 页" in htmltxt)
@@ -654,6 +662,132 @@ st, hdrs, _ = form_post("/fleet/key/rotate", {}, "")
 check("未登录随机更换跳登录", st == 303
       and "/login" in (hdrs.get("Location") or ""))
 check("未登录尝试未改掉密钥", fleet.key_plain() == rotated)
+
+# ---------- 局部更新（/fleet/partial + 护栏） ----------
+st, hdrs, _ = req("GET", "/fleet/partial")
+check("partial 未登录 303 跳登录",
+      st == 303 and "/login" in (hdrs.get("Location") or ""), f"{st}")
+
+st, hdrs, txt = req("GET", "/fleet/partial", headers={"Cookie": sess})
+check("partial 登录后 200 JSON",
+      st == 200 and "application/json" in (hdrs.get("Content-Type") or ""),
+      f"{st} {hdrs.get('Content-Type')}")
+try:
+    pj = json.loads(txt)
+except Exception:  # noqa: BLE001
+    pj = {}
+check("partial 返回 dev/sms/time 三键",
+      set(pj) >= {"dev", "sms", "time"}
+      and re.fullmatch(r"\d{2}:\d{2}:\d{2}",
+                       pj.get("time") or "") is not None,
+      str(sorted(pj))[:80])
+check("partial 片段不含接入说明整卡",
+      "接入密钥（明文" not in (pj.get("dev") or "")
+      and "接入密钥（明文" not in (pj.get("sms") or ""))
+check("partial 设备片段带分页器口径",
+      "台设备" in (pj.get("dev") or "") and "条短信" in (pj.get("sms") or ""))
+
+st, _, txt = req("GET", "/fleet/partial?dsort=phone&dorder=desc",
+                 headers={"Cookie": sess})
+pj = json.loads(txt)
+check("partial 设备片段含设备行", "13733333333" in (pj.get("dev") or ""))
+st, _, txt = req("GET", "/fleet/partial?dsort=phone&dorder=asc&dpage=2",
+                 headers={"Cookie": sess})
+pj = json.loads(txt)
+dv = pj.get("dev") or ""
+check("partial 设备排序生效",
+      0 <= dv.find("13711111111") < dv.find("13722222222")
+      < dv.find("13733333333"))
+st, _, txt = req("GET", "/fleet/partial?dpage=2", headers={"Cookie": sess})
+pj = json.loads(txt)
+check("partial 设备分页生效", "第 2/2 页" in (pj.get("dev") or ""))
+st, _, txt = req("GET", "/fleet/partial?spage=3", headers={"Cookie": sess})
+pj = json.loads(txt)
+check("partial 短信分页生效", "第 3/3 页" in (pj.get("sms") or ""))
+check("partial 短信片段含短信行", "排序短信甲" in (pj.get("sms") or ""))
+st, _, txt = req("GET", "/fleet/partial?sdev=" + S1,
+                 headers={"Cookie": sess})
+pj = json.loads(txt)
+sm = pj.get("sms") or ""
+check("partial 短信按设备筛选生效",
+      "排序短信甲" in sm and "排序短信乙" not in sm)
+st, _, txt = req("GET", "/fleet/partial?sq=" + urllib.parse.quote("排序短信"),
+                 headers={"Cookie": sess})
+pj = json.loads(txt)
+check("partial 短信关键词筛选生效",
+      "共 3 条短信" in (pj.get("sms") or ""))
+st, _, txt = req("GET", "/fleet/partial?ssort=sender&sorder=asc&sq="
+                 + urllib.parse.quote("排序短信"),
+                 headers={"Cookie": sess})
+pj = json.loads(txt)
+sm = pj.get("sms") or ""
+check("partial 短信排序生效",
+      0 <= sm.find("排序短信乙") < sm.find("排序短信甲")
+      < sm.find("排序短信丙"))
+
+# 整页与 partial 同一套渲染：总数口径一致、同一行两处都在
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+st, _, txt = req("GET", "/fleet/partial", headers={"Cookie": sess})
+pj = json.loads(txt)
+_dt1 = re.search(r"共 (\d+) 台设备", htmltxt)
+_dt2 = re.search(r"共 (\d+) 台设备", pj.get("dev") or "")
+check("整页与 partial 设备总数一致",
+      bool(_dt1) and bool(_dt2) and _dt1.group(1) == _dt2.group(1))
+_st1 = re.search(r"共 (\d+) 条短信", htmltxt)
+_st2 = re.search(r"共 (\d+) 条短信", pj.get("sms") or "")
+check("整页与 partial 短信总数一致",
+      bool(_st1) and bool(_st2) and _st1.group(1) == _st2.group(1))
+check("整页与 partial 同含最新设备行",
+      "13911112222" in htmltxt and "13911112222" in (pj.get("dev") or ""))
+
+# 护栏函数 fleetShouldSkip：抽页面 <script> 原文用 node 真跑单测
+import subprocess  # noqa: E402
+
+_scripts = re.findall(r"<script>(.*?)</script>", htmltxt, re.S)
+_js = next((s for s in _scripts if "fleetShouldSkip" in s), "")
+check("页含可抽取的护栏脚本", bool(_js))
+if _js:
+    _prelude = (
+        "var document = {hidden: false, activeElement: null,"
+        " addEventListener: function(){},"
+        " querySelectorAll: function(){ return []; },"
+        " getElementById: function(){ return null; }};\n"
+        "var window = {addEventListener: function(){},"
+        " getSelection: function(){ return {isCollapsed: true,"
+        " toString: function(){ return ''; }}; },"
+        " location: {search: ''}};\n"
+        "var setInterval = function(){ return 0; };\n"
+        "var fetch = function(){ return Promise.reject(new Error('x')); };\n"
+        "var navigator = {};\n")
+    _cases = (
+        "function mkDoc(o) { o = o || {}; return {"
+        " hidden: !!o.hidden, activeElement: o.active || null,"
+        " querySelectorAll: function(){ return o.rows || []; } }; }\n"
+        "var W = {getSelection: function(){ return {isCollapsed: true,"
+        " toString: function(){ return ''; }}; }};\n"
+        "var Wsel = {getSelection: function(){ return {isCollapsed: false,"
+        " toString: function(){ return 'abc'; }}; }};\n"
+        "var NOW = 1000000;\n"
+        "var cases = [\n"
+        " ['hidden', fleetShouldSkip(mkDoc({hidden: true}), W, NOW, 0) === true],\n"
+        " ['input', fleetShouldSkip(mkDoc({active: {tagName: 'INPUT'}}), W, NOW, 0) === true],\n"
+        " ['select', fleetShouldSkip(mkDoc({active: {tagName: 'SELECT'}}), W, NOW, 0) === true],\n"
+        " ['textarea', fleetShouldSkip(mkDoc({active: {tagName: 'TEXTAREA'}}), W, NOW, 0) === true],\n"
+        " ['selection', fleetShouldSkip(mkDoc({}), Wsel, NOW, 0) === true],\n"
+        " ['edit-open', fleetShouldSkip(mkDoc({rows: [{style: {display: ''}}]}), W, NOW, 0) === true],\n"
+        " ['edit-closed', fleetShouldSkip(mkDoc({rows: [{style: {display: 'none'}}]}), W, NOW, 0) === false],\n"
+        " ['recent', fleetShouldSkip(mkDoc({}), W, NOW, NOW - 5000) === true],\n"
+        " ['idle-ok', fleetShouldSkip(mkDoc({}), W, NOW, 0) === false]];\n"
+        "var bad = cases.filter(function(c){ return !c[1]; });\n"
+        "if (bad.length) { console.log('JSFAIL ' + bad.map(function(c){ return c[0]; }).join(',')); process.exit(1); }\n"
+        "console.log('JSOK ' + cases.length);\n")
+    _jsfile = Path(TMP) / "fleet_guard_test.js"
+    _jsfile.write_text(_prelude + _js + _cases, encoding="utf-8")
+    _r = subprocess.run(["node", str(_jsfile)], capture_output=True,
+                        text=True, timeout=30)
+    check("护栏函数 node 单测 9 例全过",
+          _r.returncode == 0 and "JSOK 9" in _r.stdout,
+          (_r.stdout + _r.stderr)[:200])
 
 srv.shutdown()
 print(f"\n== fleet: {PASS} passed, {FAIL} failed ==")
