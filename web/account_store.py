@@ -82,6 +82,8 @@ class AccountStore:
                 account["id"] = a["id"]
                 account["created_at"] = a.get("created_at") or account.get("created_at")
                 account["quota"] = account.get("quota") or a.get("quota")
+                # 网关入池开关是用户手动设的，重导入/覆盖更新时别弄丢
+                account["in_pool"] = account.get("in_pool") or a.get("in_pool")
                 accounts[i] = account
                 self.save(accounts)
                 return a["id"]

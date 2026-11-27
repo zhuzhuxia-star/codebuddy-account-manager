@@ -40,6 +40,11 @@ try:
     import u3store  # noqa: E402  对象存储（/oos 页）；缺失/损坏不影响主服务
 except Exception:  # noqa: BLE001
     u3store = None  # type: ignore
+
+try:
+    import gateway  # noqa: E402  API 网关（/v1 端点）；缺失/损坏不影响主服务
+except Exception:  # noqa: BLE001
+    gateway = None  # type: ignore
 from account_store import AccountStore, parse_pasted_text, quota_columns  # noqa: E402
 
 try:
@@ -701,7 +706,8 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             f"<div class='ameta'><span>签到：{esc(ck_text)}</span>"
             f"<span>成长计划：{esc(gr_text or '-')}</span>"
             f"{lv_html}"
-            f"<span>上次续期：{esc(rec.get('refreshed_at') or '-')}</span></div>"
+            f"<span>上次续期：{esc(rec.get('refreshed_at') or '-')}</span>"
+            f"<span>网关池：{'已入池' if rec.get('in_pool') else '未入池'}</span></div>"
             f"{pkhead_html}"
             f"{pkg_html}"
             f"<div class='aacts'>"
@@ -713,6 +719,9 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
             f"<input type='hidden' name='id' value='{rid}'><button class='gray'>额度</button></form>"
             f"<form method='post' action='/run/liveness'>"
             f"<input type='hidden' name='id' value='{rid}'><button class='gray'>测活</button></form>"
+            f"<form method='post' action='/account/pool'>"
+            f"<input type='hidden' name='id' value='{rid}'>"
+            f"<button class='gray'>{'网关池：已入池' if rec.get('in_pool') else '网关池：未入池'}</button></form>"
             f"<a class='btn gray' href='/script?id={rid}'>登录脚本</a>"
             f"<form method='post' action='/account/delete' "
             f"onsubmit='return confirm(\"确定删除这个账号？\")'>"
@@ -801,6 +810,29 @@ def online_login_page(key: str) -> bytes:
 def settings_page(msg: str = "", is_err: bool = False) -> bytes:
     conf = load_conf()
     has_pass = bool(saved_cloud_passphrase(conf))
+    gw_html = ""
+    if gateway is not None:
+        try:
+            gw_html = f"""
+<div class="card"><h2>API 网关（OpenAI 兼容）</h2>
+<p class="small">端点：<code>GET /v1/models</code>、<code>POST /v1/chat/completions</code>；
+客户端 Base URL 填本站地址加 <code>/v1</code>，API Key 填下面的密钥。
+只有在账号卡上开了「网关池」的账号才会接网关请求，令牌失效的号自动跳过。</p>
+<label>调用密钥（掩码）</label>
+<input value="{esc(gateway.key_masked())}" readonly>
+<label>调用密钥（明文，仅本管理页可见，别外传）</label>
+<textarea id="gwkey" rows="2" readonly>{esc(gateway.key_plain())}</textarea>
+<button type="button" onclick="gwCopy()">复制密钥</button>
+</div>
+<script>
+async function gwCopy() {{
+  const t = document.getElementById('gwkey');
+  try {{ await navigator.clipboard.writeText(t.value); alert('已复制'); }}
+  catch (e) {{ t.select(); document.execCommand('copy'); alert('已复制'); }}
+}}
+</script>"""
+        except Exception:  # noqa: BLE001
+            gw_html = ""
     body = f"""<h1>设置</h1>
 <div class="card"><form method="post" action="/settings">
 <label>网关 endpoint（国内版 https://www.codebuddy.cn；国际版 https://copilot.tencent.com）</label>
@@ -817,6 +849,7 @@ def settings_page(msg: str = "", is_err: bool = False) -> bytes:
 <div class="card"><h2>把服务器最新登录态推回云端</h2>
 <p class="small">续期会换新 token，推回云端后桌面版再「从云端同步」就能拿到最新登录态。</p>
 <form method="post" action="/cloud/push"><button type="submit">立即推送到云端保险库</button></form></div>
+{gw_html}
 <p><a class="btn gray" href="/">返回账号列表</a></p>"""
     return page("设置", body, msg, is_err)
 
@@ -1411,6 +1444,67 @@ class Handler(BaseHTTPRequestHandler):
             extra["Set-Cookie"] = cookie
         self._send(303, b"", extra=extra)
 
+    # -- API 网关（/v1，Bearer 密钥鉴权，不走网页登录态） --
+    def _send_json(self, code: int, obj, extra: dict | None = None):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        return self._send(code, body, "application/json; charset=utf-8", extra)
+
+    def _v1_models(self):
+        if gateway is None:
+            return self._send_json(503, {"error": {
+                "message": "网关模块未加载", "type": "server_error",
+                "code": "gateway_unavailable"}})
+        if not gateway.check_bearer(self.headers.get("Authorization") or ""):
+            return self._send_json(401, {"error": {
+                "message": "API 密钥无效", "type": "authentication_error",
+                "code": "invalid_api_key"}},
+                {"WWW-Authenticate": "Bearer"})
+        try:
+            return self._send_json(200, gateway.list_models(AccountStore()))
+        except Exception as e:  # noqa: BLE001
+            return self._send_json(500, {"error": {
+                "message": f"模型列表获取失败：{e}", "type": "server_error",
+                "code": "models_failed"}})
+
+    def _v1_chat(self):
+        if gateway is None:
+            return self._send_json(503, {"error": {
+                "message": "网关模块未加载", "type": "server_error",
+                "code": "gateway_unavailable"}})
+        if not gateway.check_bearer(self.headers.get("Authorization") or ""):
+            return self._send_json(401, {"error": {
+                "message": "API 密钥无效", "type": "authentication_error",
+                "code": "invalid_api_key"}},
+                {"WWW-Authenticate": "Bearer"})
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n > 0 else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send_json(400, {"error": {
+                "message": "请求体不是合法 JSON", "type": "invalid_request_error",
+                "code": "bad_json"}})
+        try:
+            outcome = gateway.chat(AccountStore(), body,
+                                   self.headers.get("X-Session-Id"))
+        except Exception as e:  # noqa: BLE001
+            return self._send_json(500, {"error": {
+                "message": f"网关内部错误：{e}", "type": "server_error",
+                "code": "gateway_internal"}})
+        if outcome.kind == "stream":
+            self.send_response(outcome.status)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                for chunk in outcome.payload:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        return self._send_json(outcome.status, outcome.payload)
+
     def _cookie_token(self) -> str | None:
         for part in (self.headers.get("Cookie") or "").split(";"):
             part = part.strip()
@@ -1543,6 +1637,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- 路由 --
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/v1/models":
+            return self._v1_models()
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
         msg, is_err = q.get("msg", ""), q.get("err") == "1"
         conf = load_conf()
@@ -1616,6 +1712,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/v1/chat/completions":
+            return self._v1_chat()
         if u.path == "/oos/upload":
             return self._oos_upload()
         form = self._form()
@@ -1688,6 +1786,17 @@ class Handler(BaseHTTPRequestHandler):
             with RUN_LOCK:
                 ok = store.remove(form.get("id", ""))
             return self._redirect("/", "已删除" if ok else "账号不存在", not ok)
+        if u.path == "/account/pool":
+            with RUN_LOCK:
+                rec = store.get(form.get("id", ""))
+                if rec:
+                    rec["in_pool"] = not rec.get("in_pool")
+                    store.update(rec)
+            if not rec:
+                return self._redirect("/", "账号不存在", True)
+            return self._redirect(
+                "/", f"「{rec.get('label') or ''}」已"
+                     f"{'加入' if rec['in_pool'] else '移出'}网关池")
         if u.path == "/oos/delete":
             cli = u3_client()
             key = form.get("key", "")
@@ -1753,6 +1862,11 @@ def main():
         conf["setup_token"] = secrets.token_urlsafe(24)
         save_conf(conf)
     apply_endpoint(load_conf())
+    if gateway is not None:
+        try:
+            gateway.ensure_key()
+        except Exception:  # noqa: BLE001
+            pass
     if load_conf().get("setup_token"):
         print(f"[cbam-web] 首次设置令牌：{load_conf()['setup_token']}", flush=True)
     threading.Thread(target=scheduler_loop, daemon=True).start()
