@@ -10,6 +10,7 @@ import cb_api
 import cb_cloud
 import cb_ledger
 import cb_log
+import client_profile
 import cb_runtime
 import cb_secrets as cs
 import wb_api
@@ -41,7 +42,11 @@ def _normalize_plain(plain: str, ref_id: str | None) -> str:
 
 
 def record_auth(record: dict) -> dict | None:
-    """取出账号记录里可用的 auth（accessToken/refreshToken/domain）。"""
+    """取出账号记录里可用的 auth（accessToken/refreshToken/domain）。
+
+    取到后把账号身份（uid/企业/部门）按令牌绑定到 client_profile，
+    供出站请求头取 X-User-Id 等官方字段（只存令牌哈希，不存原文）。
+    """
     from account_store import _strip_uid_prefix
     for plain in (record.get("keys") or {}).values():
         try:
@@ -52,14 +57,21 @@ def record_auth(record: dict) -> dict | None:
             continue
         auth = obj.get("auth")
         if isinstance(auth, dict) and auth.get("accessToken"):
-            return auth
+            break
         if obj.get("accessToken"):
-            return {
+            auth = {
                 "accessToken": _strip_uid_prefix(obj.get("accessToken")),
                 "refreshToken": obj.get("refreshToken") or "",
                 "domain": obj.get("domain") or "",
             }
-    return None
+            break
+    else:
+        return None
+    try:
+        client_profile.bind_auth(auth, client_profile.extract_identity(record))
+    except Exception:  # noqa: BLE001
+        pass
+    return auth
 
 
 def import_from_ide(store: AccountStore, db: Path | None = None) -> dict:

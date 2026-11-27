@@ -74,7 +74,8 @@ OPEN_MAX = 5  # 单次最多开几个盲盒（服务端 max_open_count 也是 5�
 
 def _call(method: str, path: str, auth: dict, body=None) -> dict:
     """请求并返回 data；业务失败抛 ApiError（带服务端 msg）。"""
-    resp = cb_api._request(method, path, body=body, auth=auth, timeout=20)
+    resp = cb_api._request(method, path, body=body, auth=auth, timeout=20,
+                           profile="framework")
     if resp.get("code") != 0:
         raise cb_api.ApiError(f"code={resp.get('code')} {resp.get('msg') or ''}",
                               code=resp.get("code"))

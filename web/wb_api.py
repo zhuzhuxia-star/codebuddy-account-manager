@@ -82,7 +82,8 @@ def fetch_status(auth: dict, endpoint: str | None = None) -> dict:
     out = {"ok": False, "data": None, "error": ""}
     try:
         resp = cb_api._request("POST", STATUS_PATH, body={}, auth=auth,
-                               timeout=20, endpoint=endpoint)
+                               timeout=20, endpoint=endpoint,
+                               profile="authservice")
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:200]
         return out
@@ -103,7 +104,8 @@ def checkin(auth: dict, endpoint: str | None = None) -> dict:
     }
     try:
         resp = cb_api._request("POST", CHECKIN_PATH, body={}, auth=auth,
-                               timeout=20, endpoint=endpoint)
+                               timeout=20, endpoint=endpoint,
+                               profile="authservice")
     except cb_api.ApiError as e:
         # 服务端业务码（如 10001 今天已签到）也会带 HTTP 400，按业务结果处理
         out["message"] = _server_msg(str(e)) or ""

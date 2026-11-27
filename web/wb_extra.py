@@ -37,6 +37,7 @@ from pathlib import Path
 
 import cb_api
 import cb_log
+import client_profile
 
 REPORT_PATH = "/v2/report"
 DEVICE_CODE_PATH = "/v2/plugin/device/auth/code"
@@ -141,9 +142,6 @@ def report_activity(auth: dict, uid: str, nickname: str,
     if not uid:
         return {"ok": False, "error": "账号缺 uid，无法上报", "endpoint": ""}
     ev = build_activity_event(uid, nickname or "")
-    headers = {"X-Requested-With": "XMLHttpRequest", "X-Product": "SaaS",
-               "X-User-Id": uid, "User-Agent": DAEMON_UA,
-               "X-Request-ID": uuid.uuid4().hex}
     bases = []
     for ep in (endpoint or cb_api.resolve_endpoint(), WEB_BASE_FALLBACK):
         ep = (ep or "").rstrip("/")
@@ -152,9 +150,10 @@ def report_activity(auth: dict, uid: str, nickname: str,
     err = ""
     for ep in bases:
         try:
+            # 上报走后台服务框架画像 + 专用 Content-Type（;charset=UTF-8）
             resp = cb_api._request("POST", REPORT_PATH, body=[ev], auth=auth,
-                                   timeout=20, endpoint=ep,
-                                   extra_headers=headers)
+                                   timeout=20, endpoint=ep, profile="report",
+                                   identity={"uid": uid})
             code = resp.get("code") if isinstance(resp, dict) else None
             if code in (0, None):
                 return {"ok": True, "error": "", "endpoint": ep}
@@ -208,17 +207,26 @@ def _fetch_device_code(base: str, auth: dict, uid: str) -> str:
         "Content-Type": "application/json",
         "Accept": "*/*", "Accept-Language": "*", "Sec-Fetch-Mode": "cors",
         "User-Agent": "node",
+        # Node fetch（undici）自动加的 Accept-Encoding
+        "Accept-Encoding": ("br, gzip, deflate" if client_profile._HAS_BROTLI
+                            else "gzip, deflate"),
         "Authorization": f"Bearer {auth.get('accessToken') or ''}",
         "X-User-Id": uid,
         "X-Domain": auth.get("domain") or urllib.parse.urlparse(base).hostname,
     }
+    ident = client_profile.identity_for(auth) or {}
+    if ident.get("enterprise_id"):
+        headers["X-Enterprise-Id"] = str(ident["enterprise_id"])
+        headers["X-Tenant-Id"] = str(ident["enterprise_id"])
     if auth.get("refreshToken"):
         headers["X-Refresh-Token"] = auth["refreshToken"]
     req = urllib.request.Request(base + DEVICE_CODE_PATH, data=b"",
                                  headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = client_profile.decode_body(
+                resp.read(), resp.headers.get("Content-Encoding")
+            ).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
         raise cb_api.ApiError(f"登录码 HTTP {e.code}: {raw[:200]}",
@@ -251,6 +259,8 @@ def _acquire_session(base: str, auth: dict, uid: str, target: str) -> list[dict]
         "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
         "Accept-Language": "zh-CN,zh;q=0.9",
+        "Sec-CH-UA-Platform": "\"macOS\"",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
     })
     try:
         with opener.open(req, timeout=25) as resp:
@@ -280,7 +290,7 @@ def _cookie_header(cookies: list[dict], base: str) -> str:
 
 
 def _web_once(base: str, cookies: list[dict], method: str, path: str,
-              referer_path: str, body) -> object:
+              referer_path: str, body, identity: dict | None = None) -> object:
     """带 Cookie 发一次网页 XHR 形状请求并解信封，返回 data。"""
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -291,8 +301,14 @@ def _web_once(base: str, cookies: list[dict], method: str, path: str,
                             else "zh-CN,zh;q=0.9"),
         "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
+        "Sec-CH-UA-Platform": "\"macOS\"",
+        # Chrome 口径 gzip, deflate, br, zstd；只宣告本运行时能解的编码
+        "Accept-Encoding": ("gzip, deflate, br" if client_profile._HAS_BROTLI
+                            else "gzip, deflate"),
         "Cookie": _cookie_header(cookies, base),
     }
+    if identity and identity.get("enterprise_id"):
+        headers["X-Enterprise-Id"] = str(identity["enterprise_id"])
     data = None
     if method != "GET":
         headers["Origin"] = base
@@ -305,7 +321,9 @@ def _web_once(base: str, cookies: list[dict], method: str, path: str,
                                  method=method)
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = client_profile.decode_body(
+                resp.read(), resp.headers.get("Content-Encoding")
+            ).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raw = ""
         try:
@@ -339,6 +357,7 @@ def web_json(auth: dict, uid: str, method: str, path: str, referer_path: str,
     if saved.get("base") in bases:
         bases.remove(saved["base"])
         bases.insert(0, saved["base"])
+    identity = client_profile.identity_for(auth)
 
     def acquire_and_call() -> object:
         err = ""
@@ -351,13 +370,14 @@ def web_json(auth: dict, uid: str, method: str, path: str, referer_path: str,
             sessions[uid] = {"base": base, "cookies": cookies,
                              "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
             _save_sessions(sessions)
-            return _web_once(base, cookies, method, path, referer_path, body)
+            return _web_once(base, cookies, method, path, referer_path, body,
+                             identity)
         raise cb_api.ApiError(f"获取网页登录态失败：{err}")
 
     if saved.get("cookies"):
         try:
             return _web_once(saved["base"], saved["cookies"], method, path,
-                             referer_path, body)
+                             referer_path, body, identity)
         except _NeedRenew:
             sessions.pop(uid, None)
             _save_sessions(sessions)

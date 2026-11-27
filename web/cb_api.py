@@ -28,11 +28,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import cb_log
+import client_profile
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 PREFIX_PATH = "/plugin"
 PLATFORM = "ide"
-USER_AGENT = "curl/8.0.1"
 
 # 轮询重试码（与 IDE 一致：等用户完成浏览器登录）
 RETRY_FETCH_TOKEN = 11217
@@ -103,25 +103,47 @@ def resolve_endpoint() -> str:
 
 
 # ---------- HTTP ----------
+# 出站画像按 client_profile（官方客户端原始请求口径）：
+#   profile="framework"    后台服务请求框架（登录/刷新/成长等）
+#   profile="authservice"  AuthService（积分/签到）
+#   profile="login"        框架 + 登录链路头（LoginTrace）
+#   profile="report"       框架 + 上报专用 Content-Type(;charset=UTF-8)
+_login_traces: dict[str, client_profile.LoginTrace] = {}
+
+
 def _request(method: str, path: str, *, auth: dict | None = None, body=None,
              timeout: float = 15.0, endpoint: str | None = None,
-             extra_headers: dict | None = None) -> dict:
+             extra_headers: dict | None = None,
+             profile: str = "framework", accept_language: bool = False,
+             identity: dict | None = None,
+             login_trace: client_profile.LoginTrace | None = None,
+             trace_kind: str = "default", root_trace: bool = False) -> dict:
     endpoint = (endpoint or resolve_endpoint()).rstrip("/")
     url = endpoint + path
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        # 网关会拦截默认 UA（Python-urllib），此处使用与 IDE/curl 一致的 UA
-        "User-Agent": USER_AGENT,
-        H_DOMAIN: urllib.parse.urlparse(endpoint).netloc,
-    }
-    if auth and auth.get("accessToken"):
-        headers["Authorization"] = f"Bearer {auth['accessToken']}"
+    domain = (auth.get("domain") if auth else "") \
+        or urllib.parse.urlparse(endpoint).netloc
+    if identity is None:
+        identity = client_profile.identity_for(auth)
+    if profile == "authservice":
+        headers = client_profile.authservice_headers(
+            auth, domain, identity, accept_language=accept_language)
+    elif profile == "report":
+        headers = client_profile.framework_headers(
+            auth, domain, identity, has_body=body is not None,
+            content_type="application/json;charset=UTF-8")
     else:
-        headers[H_NO_AUTH] = "true"
-        headers[H_NO_USER] = "true"
-        headers[H_NO_ENTERPRISE] = "true"
-        headers[H_NO_DEPARTMENT] = "true"
+        headers = client_profile.framework_headers(
+            auth, domain, identity, has_body=body is not None)
+        if profile == "login":
+            if not (auth and auth.get("accessToken")):
+                headers[H_NO_AUTH] = "true"
+                headers[H_NO_USER] = "true"
+                headers[H_NO_ENTERPRISE] = "true"
+                headers[H_NO_DEPARTMENT] = "true"
+            if login_trace is not None:
+                headers.update(login_trace.headers(trace_kind))
+        elif root_trace:
+            headers.update(client_profile.root_trace_headers())
     if extra_headers:
         headers.update(extra_headers)
 
@@ -132,12 +154,18 @@ def _request(method: str, path: str, *, auth: dict | None = None, body=None,
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-        cb_log.log(f"{method} {path} -> HTTP {resp.status} ({time.time() - t0:.2f}s)", "api")
+            status = resp.status
+            raw = client_profile.decode_body(
+                resp.read(), resp.headers.get("Content-Encoding")
+            ).decode("utf-8", errors="replace")
+        cb_log.log(f"{method} {path} -> HTTP {status} ({time.time() - t0:.2f}s)", "api")
     except urllib.error.HTTPError as e:
         raw = ""
         try:
-            raw = e.read().decode("utf-8", errors="replace")
+            raw = client_profile.decode_body(
+                e.read(), (e.headers.get("Content-Encoding")
+                           if e.headers else None)
+            ).decode("utf-8", errors="replace")
         except Exception:
             pass
         code = None
@@ -185,11 +213,15 @@ def _calc_expires(auth: dict) -> None:
 # ---------- 登录流程 ----------
 def fetch_auth_state(endpoint: str | None = None) -> dict:
     """第 1 步：拿到 state 与浏览器登录地址。"""
+    trace = client_profile.LoginTrace()
     resp = _request("POST", f"/v2{PREFIX_PATH}/auth/state?platform={PLATFORM}",
-                    body={}, timeout=15, endpoint=endpoint)
+                    body={}, timeout=15, endpoint=endpoint, profile="login",
+                    login_trace=trace, trace_kind="state",
+                    extra_headers={"X-Custom-Channel-Id": "unknown"})
     data = _data(resp) or {}
     if not data.get("state") or not data.get("authUrl"):
         raise ApiError(f"获取登录地址失败：{json.dumps(resp, ensure_ascii=False)[:300]}")
+    _login_traces[data["state"]] = trace
     return data
 
 
@@ -202,7 +234,9 @@ def poll_auth_token(state: str, *, timeout: float = 300.0, interval: float = 1.5
             raise CanceledError("已取消登录")
         try:
             resp = _request("GET", f"/v2{PREFIX_PATH}/auth/token?state={urllib.parse.quote(state)}",
-                            timeout=15, endpoint=endpoint)
+                            timeout=15, endpoint=endpoint, profile="login",
+                            login_trace=_login_traces.get(state),
+                            trace_kind="token")
             data = _data(resp) or {}
             if data.get("accessToken"):
                 _calc_expires(data)
@@ -224,6 +258,9 @@ def poll_login_account(state: str, auth: dict, *, timeout: float = 60.0, interva
         try:
             resp = _request("GET", f"/v2{PREFIX_PATH}/login/account?state={urllib.parse.quote(state)}",
                             auth=auth, timeout=15, endpoint=endpoint,
+                            profile="login",
+                            login_trace=_login_traces.get(state),
+                            trace_kind="account",
                             extra_headers={H_NO_USER: "true", H_NO_ENTERPRISE: "true",
                                            H_NO_DEPARTMENT: "true"})
             data = _data(resp) or {}
@@ -240,7 +277,7 @@ def fetch_accounts(auth: dict, endpoint: str | None = None) -> list[dict]:
     """第 5 步：该登录态下可选账号列表（个人/企业）。"""
     try:
         resp = _request("GET", f"/v2{PREFIX_PATH}/accounts", auth=auth,
-                        timeout=15, endpoint=endpoint)
+                        timeout=15, endpoint=endpoint, profile="framework")
         return (_data(resp) or {}).get("accounts") or []
     except ApiError:
         return []
@@ -251,13 +288,14 @@ def refresh_auth(auth: dict, endpoint: str | None = None) -> dict:
     if not auth.get("refreshToken"):
         raise ApiError("该账号没有 refresh token，无法续期")
     resp = _request("POST", f"/v2{PREFIX_PATH}/auth/token/refresh", body={},
-                    timeout=20, endpoint=endpoint,
+                    auth=auth, timeout=20, endpoint=endpoint,
+                    profile="framework", root_trace=True,
                     extra_headers={H_REFRESH_TOKEN: auth["refreshToken"],
-                                   H_REFRESH_SOURCE: "plugin",
-                                   H_DOMAIN: auth.get("domain") or ""})
+                                   H_REFRESH_SOURCE: "plugin"})
     data = _data(resp) or {}
     if not data.get("accessToken"):
         raise ApiError(f"续期失败：{json.dumps(resp, ensure_ascii=False)[:300]}")
+    client_profile.propagate_binding(auth, data)
     if not data.get("domain"):
         data["domain"] = auth.get("domain") or ""
     _calc_expires(data)
@@ -268,7 +306,8 @@ def refresh_auth(auth: dict, endpoint: str | None = None) -> dict:
 def fetch_payment_type(auth: dict, endpoint: str | None = None) -> str:
     try:
         resp = _request("POST", "/v2/billing/meter/get-payment-type", body={},
-                        auth=auth, timeout=15, endpoint=endpoint)
+                        auth=auth, timeout=15, endpoint=endpoint,
+                        profile="authservice", accept_language=True)
         return ((_data(resp) or {}).get("paymentType") or "")
     except ApiError:
         return ""
@@ -350,7 +389,8 @@ def fetch_quota(auth: dict, endpoint: str | None = None) -> dict:
             "PackageEndTimeRangeEnd": fmt(far),
         }
         resp = _request("POST", "/v2/billing/meter/get-user-resource", body=body,
-                        auth=auth, timeout=20, endpoint=endpoint)
+                        auth=auth, timeout=20, endpoint=endpoint,
+                        profile="authservice", accept_language=True)
         res = ((_data(resp) or {}).get("Response") or {}).get("Data") or {}
         raw_items = res.get("Accounts") or []
 
@@ -362,8 +402,18 @@ def fetch_quota(auth: dict, endpoint: str | None = None) -> dict:
             total = _num(it.get("CycleCapacitySizePrecise") or it.get("CycleCapacitySize"))
             left = _num(it.get("CycleCapacityRemainPrecise") or it.get("CycleCapacityRemain"))
             used = max(0, total - left)
-            expire_ms = _parse_ms(it.get("CycleEndTime")) if is_daily \
-                else _parse_ms(it.get("DeductionEndTime") or it.get("CycleEndTime"))
+            # 到期时刻按官方口径分包型（official-client.md「积分包的到期时刻」）：
+            # 每日包看 CycleEndTime；一次性包（活动/加量）看 DeductionEndTime；
+            # 订阅/体验类看 CycleEndTime（刷新时刻）。缺失时按官方回落链取值。
+            cycle_end = _parse_ms(it.get("CycleEndTime"))
+            if is_daily:
+                expire_ms = cycle_end
+            elif code in (COMMODITY_ACTIVITY, COMMODITY_EXTRA):
+                expire_ms = _parse_ms(it.get("DeductionEndTime")) \
+                    or _parse_ms(it.get("ExpiredTime")) or cycle_end
+            else:
+                expire_ms = cycle_end or _parse_ms(it.get("ExpiredTime")) \
+                    or _parse_ms(it.get("DeductionEndTime"))
             refresh_ms = _parse_ms(it.get("CycleEndTime"))
             parsed.append({
                 "code": code,
