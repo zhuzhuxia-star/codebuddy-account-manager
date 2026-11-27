@@ -242,23 +242,29 @@ st, hdrs, _ = form_post("/fleet/device/update",
 check("编辑不存在的设备回 err", "err=1" in (hdrs.get("Location") or ""),
       hdrs.get("Location") or "")
 
-# ---------- 短信 1 小时自动清理 ----------
+# ---------- 短信 30 分钟自动清理 ----------
 st, _, _ = req("POST", "/api/v1/sms",
                {"imei": IMEI, "content": "过期短信XYZ"}, KEY_H)
 check("待过期短信先入库", st == 200)
 conn = sqlite3.connect(str(fleet.DB_FILE))
 conn.execute("UPDATE sms SET received_at=? WHERE content='过期短信XYZ'",
-             (time.time() - 3700,))
+             (time.time() - 31 * 60,))
+conn.execute("INSERT INTO sms(imei, sender, content, device_ts, received_at)"
+             " VALUES(?,?,?,?,?)",
+             (IMEI, "10086", "临界保留短信",
+              time.time() - 29 * 60, time.time() - 29 * 60))
 conn.commit()
 conn.close()
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
-check("超 1 小时短信读页面时被清", "过期短信XYZ" not in htmltxt)
+check("超 30 分钟短信读页面时被清", "过期短信XYZ" not in htmltxt)
 check("过期短信已从库清除",
       all(m["content"] != "过期短信XYZ" for m in fleet.list_sms()))
-check("页面写明 1 小时规则", "短信保留 1 小时" in htmltxt)
-# 入库顺带清：直插一条老短信，再经 API 入一条新的，老的应被清掉
+check("29 分钟短信保留",
+      any(m["content"] == "临界保留短信" for m in fleet.list_sms()))
+check("页面写明 30 分钟规则", "短信保留 30 分钟" in htmltxt)
+# 入库顺带清：直插一条 31 分钟前的老短信，再经 API 入一条新的，老的应被清掉
 conn = sqlite3.connect(str(fleet.DB_FILE))
-old_ts = time.time() - 3700
+old_ts = time.time() - 31 * 60
 conn.execute("INSERT INTO sms(imei, sender, content, device_ts, received_at)"
              " VALUES(?,?,?,?,?)", (IMEI, "10086", "老短信入库清",
                                     old_ts, old_ts))
@@ -267,6 +273,53 @@ conn.close()
 req("POST", "/api/v1/sms", {"imei": IMEI, "content": "新短信触发清"}, KEY_H)
 check("新短信入库顺带清过期",
       all(m["content"] != "老短信入库清" for m in fleet.list_sms()))
+
+# ---------- 设备 30 分钟无心跳自动删除 ----------
+V_OLD = "860000000002101"    # 31 分钟 → 读列表时被清
+V_KEEP = "860000000002102"   # 29 分钟 → 保留
+V_HB = "860000000002103"     # 31 分钟 → 心跳入库顺带清
+V_SMS = "860000000002104"    # 31 分钟 → 短信入库顺带清
+TRIG = "860000000002109"     # 触发清理的另一台设备
+for v in (V_OLD, V_KEEP, V_HB, V_SMS):
+    fleet.heartbeat({"imei": v, "online": True})
+
+
+def _backdate(imei, sec):
+    c = sqlite3.connect(str(fleet.DB_FILE))
+    c.execute("UPDATE devices SET last_seen=? WHERE imei=?",
+              (time.time() - sec, imei))
+    c.commit()
+    c.close()
+
+
+def _dev_exists(imei):
+    c = sqlite3.connect(str(fleet.DB_FILE))
+    n = c.execute("SELECT COUNT(*) FROM devices WHERE imei=?",
+                  (imei,)).fetchone()[0]
+    c.close()
+    return n > 0
+
+
+_backdate(V_OLD, 31 * 60)
+_backdate(V_KEEP, 29 * 60)
+devs = {x["imei"] for x in fleet.list_devices()}
+check("31 分钟无心跳设备读列表时被删", V_OLD not in devs)
+check("29 分钟设备保留", V_KEEP in devs)
+_backdate(V_HB, 31 * 60)
+fleet.heartbeat({"imei": TRIG, "online": True})
+check("心跳入库顺带删过期设备", not _dev_exists(V_HB))
+_backdate(V_SMS, 31 * 60)
+fleet.record_sms({"imei": TRIG, "content": "触发删设备短信"})
+check("短信入库顺带删过期设备", not _dev_exists(V_SMS))
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("页面写明设备 30 分钟规则", "设备 30 分钟无心跳自动删除" in htmltxt)
+# 清理本节专用设备/短信，别影响后面分页计数
+conn = sqlite3.connect(str(fleet.DB_FILE))
+conn.execute("DELETE FROM devices WHERE imei IN (?,?,?,?,?)",
+             (V_OLD, V_KEEP, V_HB, V_SMS, TRIG))
+conn.execute("DELETE FROM sms WHERE content='触发删设备短信'")
+conn.commit()
+conn.close()
 
 # ---------- 短信手动删 / 清空 ----------
 msgs = fleet.list_sms()

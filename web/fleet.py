@@ -8,8 +8,11 @@
     改密钥或随机换一把，换后旧密钥立即失效。
   - IMEI 即设备身份（本轮不做逐设备密钥）。
   - 存储 DATA_DIR/fleet.db（SQLite）：devices / sms 两张表。
-  - 短信只保留 SMS_TTL 秒（1 小时）：读列表与新短信入库时顺带清理
+  - 短信只保留 SMS_TTL 秒（30 分钟）：读列表与新短信入库时顺带清理
     过期短信，管理页也可手动删单条 / 清空全部。
+  - 设备 last_seen 超过 DEVICE_TTL 秒（30 分钟无心跳）自动删除：
+    读设备列表、心跳入库、短信入库时顺带清理；从没发过心跳的占位
+    设备（last_seen 为空）不在此列。被删设备再发心跳会自然重建。
   - 设备可由管理页编辑手机号 / 类型 / 备注（type 也可随心跳上报）。
   - 设备记 online_since（本次连续在线的起始时间）：从离线转在线时
     打点、持续在线不刷新、上报离线时清空，页面据此显示「在线时长」。
@@ -41,7 +44,8 @@ DB_FILE = DATA_DIR / "fleet.db"
 LOG_FILE = DATA_DIR / "fleet_access.log"
 
 ONLINE_WINDOW = 180  # 秒：最后心跳在此窗口内且上报在线才算在线
-SMS_TTL = 3600  # 秒：短信只保留 1 小时，过期自动清理
+SMS_TTL = 1800  # 秒：短信只保留 30 分钟，过期自动清理
+DEVICE_TTL = 1800  # 秒：设备 30 分钟无心跳（last_seen 过期）自动删除
 PAGE_SIZE = 20  # 管理页设备表 / 短信表每页条数
 
 # ---------- 接入密钥 ----------
@@ -303,6 +307,10 @@ def heartbeat(body: dict):
                  _opt_str(body, "model"), battery_s,
                  _opt_str(body, "app_version"), _opt_str(body, "type"),
                  online_since))
+            # 顺带清理 30 分钟无心跳的设备（本机刚 upsert、last_seen
+            # 是最新，不会误删自己）
+            conn.execute("DELETE FROM devices WHERE last_seen < ?",
+                         (now - DEVICE_TTL,))
             conn.commit()
         finally:
             conn.close()
@@ -333,6 +341,10 @@ def record_sms(body: dict):
                 (imei, _opt_str(body, "from"), content, device_ts, now))
             conn.execute("DELETE FROM sms WHERE received_at < ?",
                          (now - SMS_TTL,))
+            # 顺带清理 30 分钟无心跳的设备（短信不算心跳；本机若刚建
+            # 占位行 last_seen 为空，不在此列）
+            conn.execute("DELETE FROM devices WHERE last_seen < ?",
+                         (now - DEVICE_TTL,))
             conn.commit()
             rid = cur.lastrowid
         finally:
@@ -355,6 +367,7 @@ def _device_out(r, now: float) -> dict:
 
 def list_devices(now: float | None = None) -> list[dict]:
     now = time.time() if now is None else now
+    purge_old_devices(now)
     conn = _db()
     try:
         rows = conn.execute(
@@ -394,6 +407,7 @@ def list_devices_page(page: int = 1, per_page: int = PAGE_SIZE,
     """设备分页：返回 (本页设备列表, 总数)。页码越界自动夹到有效范围。
     sort ∈ phone/type/status/duration/last_seen（默认最后心跳降序）。"""
     now = time.time() if now is None else now
+    purge_old_devices(now)
     if sort not in ("phone", "type", "status", "duration", "last_seen"):
         sort = "last_seen"
     order = "asc" if order == "asc" else "desc"
@@ -444,6 +458,22 @@ def purge_old_sms(now: float | None = None) -> int:
         try:
             cur = conn.execute("DELETE FROM sms WHERE received_at < ?",
                                (now - SMS_TTL,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def purge_old_devices(now: float | None = None) -> int:
+    """删掉 last_seen 超过 DEVICE_TTL（30 分钟无心跳）的设备，返回
+    删掉台数。从没发过心跳的占位设备 last_seen 为空，SQL 比较不成立，
+    不会被删。被删设备之后再发心跳会按 upsert 自然重建。"""
+    now = time.time() if now is None else now
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute("DELETE FROM devices WHERE last_seen < ?",
+                               (now - DEVICE_TTL,))
             conn.commit()
             return cur.rowcount
         finally:

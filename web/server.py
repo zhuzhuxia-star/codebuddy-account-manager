@@ -1211,7 +1211,8 @@ def _fleet_tables(dpage: int, spage: int, sdev: str, sq: str,
         dpage, dpages, dtotal, "台设备",
         lambda p: "/fleet" + _fleet_qs(p, spage, sdev, sq,
                                        dsort, dorder, ssort, sorder))
-    dev_inner = ("<table>"
+    dev_inner = ("<p class='small'>设备 30 分钟无心跳自动删除。</p>"
+                "<table>"
                 "<tr><th>IMEI</th>"
                 + dev_th("手机号", "phone") + dev_th("类型", "type")
                 + "<th>备注</th>" + dev_th("状态", "status")
@@ -1274,7 +1275,7 @@ def _fleet_tables(dpage: int, spage: int, sdev: str, sq: str,
                   f"{_fleet_qs(dpage, 1, '', '', dsort, dorder, ssort, sorder)}#sms'>清除筛选</a>"
                   if (sdev or sq) else "")
     sms_inner = (
-        "<p class='small'>短信保留 1 小时，过期自动删除。上传时间 = 服务器"
+        "<p class='small'>短信保留 30 分钟，过期自动删除。上传时间 = 服务器"
         "收到短信的时间，短信时间 = 设备上报的短信时间。</p>"
         "<form method='get' action='/fleet' class='row'>"
         f"<input type='hidden' name='dpage' value='{dpage}'>"
@@ -1314,8 +1315,8 @@ def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
     各自服务端分页（dpage/spage 互不影响）；两表可排序列的表头各
     常驻一对 ▲▼ 小箭头点排序（列名本身不可点；服务端排序
     dsort/dorder、ssort/sorder，当前方向箭头高亮，与分页/筛选共存）；
-    短信只保留 1 小时、可筛选/复制/删除，时间分上传时间（服务器收到）
-    与短信时间（设备上报）两列。页底「最近请求」展示两个接口最近
+    设备 30 分钟无心跳自动删除；短信只保留 30 分钟、可筛选/复制/删除，
+    时间分上传时间（服务器收到）与短信时间（设备上报）两列。页底「最近请求」展示两个接口最近
     50 条脱敏请求日志（fleet_access.log，200 绿色、其余红色）。
     在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
     （fleet 列表函数已算好 online_now）。"""
