@@ -184,7 +184,7 @@ class U3Client:
     # ---- 带查询串的签名请求（分片上传 / 流式下载用） ----
     def request_q(self, method: str, bucket: str, key: str, query: str,
                   body: bytes = b"", headers_extra: dict | None = None,
-                  stream: bool = False):
+                  stream: bool = False, headers_unsigned: dict | None = None):
         path = self._path(bucket, key)
         now = datetime.now(timezone.utc)
         amzdate = now.strftime("%Y%m%dT%H%M%SZ")
@@ -209,6 +209,8 @@ class U3Client:
             data=body if method in ("PUT", "POST") else None,
             headers=headers, method=method)
         req.add_header("User-Agent", UA)
+        for k, v in (headers_unsigned or {}).items():
+            req.add_header(k, v)
         try:
             resp = urllib.request.urlopen(req, timeout=300)
             if stream:
@@ -219,10 +221,23 @@ class U3Client:
             data = e.read()
             raise U3Error(f"HTTP {e.code}: {data[:300].decode('utf-8', 'replace')}") from e
 
-    def open_get(self, bucket: str, key: str):
-        """打开一个已签名的 GET 响应流，返回 (headers, resp)，调用方负责读完/关闭。"""
-        _st, headers, resp = self.request_q("GET", bucket, key, "", stream=True)
-        return headers, resp
+    def open_get(self, bucket: str, key: str, range_header: str | None = None):
+        """打开一个已签名的 GET 响应流，返回 (status, headers, resp)，调用方负责读完/关闭。
+
+        range_header（如 "bytes=0-1023"）以**不签名**方式转发：Garage 拒绝
+        签名头里的 range（实测报 signed header `range` is not present），
+        而 SigV4 允许附加未签名头，Range 照常生效。媒体在线播放/断点续传
+        靠它拿到 206 分段响应。
+        """
+        unsigned = {"Range": range_header} if range_header else None
+        return self.request_q("GET", bucket, key, "", stream=True,
+                              headers_unsigned=unsigned)
+
+    def open_head(self, bucket: str, key: str):
+        """HEAD 取对象元信息，返回 headers（播放器探测时用）。"""
+        _st, headers, resp = self.request_q("HEAD", bucket, key, "", stream=True)
+        resp.close()
+        return headers
 
     # ---- 分片上传 ----
     def mp_create(self, bucket: str, key: str, content_type: str = "") -> str:
