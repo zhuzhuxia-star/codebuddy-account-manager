@@ -148,5 +148,55 @@ check("目录拉不到时显示提示句", "模型目录暂时拉不到" in html
 check("拉不到时不出现模型表", "积分倍率（credits）" not in html2)
 gateway._fetch_catalog_raw = orig_raw
 
+# ---------- 5. 思考档位列 + 表头排序（二期追加） ----------
+print("[5] 思考档位列与表头点击排序")
+reset_cache()
+rows = gateway.catalog_display(store)
+by_id = {r["id"]: r for r in rows or []}
+sample_by_id = {m["id"]: m for m in SAMPLE if m.get("id")}
+g = by_id.get("glm-5.3-flash") or {}
+gs = (sample_by_id.get("glm-5.3-flash") or {}).get("reasoning") or {}
+check("思考档位列字段存在",
+      "reasoning_supported" in g and "reasoning_default" in g
+      and "reasoning_can_disable" in g)
+check("glm-5.3-flash 支持档位与样本逐字一致",
+      g.get("reasoning_supported") == gs.get("supportedEfforts"),
+      f"{g.get('reasoning_supported')} vs {gs.get('supportedEfforts')}")
+check("glm-5.3-flash 默认档位与样本逐字一致",
+      g.get("reasoning_default") == gs.get("defaultEffort"),
+      f"{g.get('reasoning_default')} vs {gs.get('defaultEffort')}")
+check("glm-5.3-flash 可关思考与样本逐字一致",
+      g.get("reasoning_can_disable") == gs.get("canDisableThinking"),
+      f"{g.get('reasoning_can_disable')} vs {gs.get('canDisableThinking')}")
+a = by_id.get("auto") or {}
+check("auto 只有固定 effort、无档位列表",
+      a.get("reasoning_supported") is None
+      and a.get("reasoning_default") == "high",
+      str({k: a.get(k) for k in ("reasoning_supported", "reasoning_default")}))
+k = by_id.get("kling-video-v3") or {}
+check("目录没给 reasoning 的模型档位全空",
+      k.get("reasoning_supported") is None
+      and k.get("reasoning_default") is None
+      and k.get("reasoning_can_disable") is None)
+check("排序键：上下文数值=默认档位数", g.get("context_num") == 300000,
+      str(g.get("context_num")))
+check("排序键：倍率数值=x 后数字", g.get("credits_num") == 0.08,
+      str(g.get("credits_num")))
+check("排序键：思考权重 high=3", g.get("reasoning_rank") == 3,
+      str(g.get("reasoning_rank")))
+
+reset_cache()
+html = server.settings_page().decode("utf-8")
+check("思考档位列表头在", "思考档位" in html)
+check("思考档位值渲染（档位+默认）",
+      "low / high / max（默认 high）" in html)
+check("排序 JS 存在", "function gwSort" in html)
+check("五个列头都带排序绑定",
+      html.count('onclick="gwSort(this)"') == 5,
+      str(html.count('onclick="gwSort(this)"')))
+check("模型表带 id", 'id="gw-models"' in html)
+check("数值单元格带 data-v 排序键", 'data-v="300000"' in html
+      and 'data-v="0.08"' in html)
+
 print(f"\nPASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

@@ -807,6 +807,29 @@ def online_login_page(key: str) -> bytes:
     return doc
 
 
+def _gw_think_text(r: dict) -> str:
+    """「思考档位」列文本：官方目录 reasoning 字段原样呈现——
+    supportedEfforts 列表 + 默认档位（defaultEffort 或固定 effort），
+    canDisableThinking 给出时标注可否关思考；目录没给 reasoning 的
+    模型整列标「—」。"""
+    supported = r.get("reasoning_supported")
+    default = r.get("reasoning_default")
+    if not supported and not default:
+        return "—"
+    if supported:
+        text = " / ".join(supported)
+        if default:
+            text += f"（默认 {default}）"
+    else:
+        text = str(default)
+    can = r.get("reasoning_can_disable")
+    if can is True:
+        text += " · 可关思考"
+    elif can is False:
+        text += " · 不可关思考"
+    return text
+
+
 def _gw_info_html() -> str:
     """设置页 API 网关卡下方的参考区：完整端点 + 与官方目录同源的模型表。
     数据与 /v1/models 同一次 /v3/config 获取、同一缓存；目录拉不到时
@@ -830,14 +853,63 @@ def _gw_info_html() -> str:
         ctx = esc(r["context"]) if r["context"] else "—"
         out = esc(str(r["max_output"])) if r["max_output"] else "—"
         cred = esc(str(r["credits"])) if r["credits"] is not None else "—"
-        trs.append(f"<tr><td><code>{esc(r['id'])}</code>{tag}</td>"
-                   f"<td>{ctx}</td><td>{out}</td><td>{cred}</td></tr>")
+        think = _gw_think_text(r)
+        cv = r.get("context_num")
+        mv = r.get("max_output")
+        kv = r.get("credits_num")
+        tv = r.get("reasoning_rank")
+        trs.append(
+            f"<tr><td data-v=\"{esc(r['id'])}\"><code>{esc(r['id'])}</code>{tag}</td>"
+            f"<td data-v=\"{'' if cv is None else cv}\">{ctx}</td>"
+            f"<td data-v=\"{'' if mv is None else mv}\">{out}</td>"
+            f"<td data-v=\"{'' if kv is None else kv}\">{cred}</td>"
+            f"<td data-v=\"{'' if tv is None else tv}\">{esc(think)}</td></tr>")
+    ths = "".join(
+        f"<th class=\"sortable\" data-type=\"{t}\" data-dir=\"\" "
+        f"onclick=\"gwSort(this)\">{label}<span class=\"sort-ind\"></span></th>"
+        for label, t in (("模型", "text"), ("上下文", "num"),
+                         ("最大输出", "num"), ("积分倍率（credits）", "num"),
+                         ("思考档位", "num")))
     return ("<div class=\"card\"><h2>网关参考（与官方目录一致）</h2>" + ep +
             "<p class='small'>每次请求按所用模型的积分倍率扣积分，下表「积分倍率」"
             "即官方目录字段 credits 的原值；标「—」表示官方目录未给该字段"
-            "（如 auto，官方说明为积分倍率随所选模型浮动）。</p>"
-            "<table><tr><th>模型</th><th>上下文</th><th>最大输出</th>"
-            "<th>积分倍率（credits）</th></tr>" + "".join(trs) + "</table></div>")
+            "（如 auto，官方说明为积分倍率随所选模型浮动）。「思考档位」为"
+            "官方目录 reasoning 字段原值：支持档位列表与默认档位；点表头可排序，"
+            "再点一次反向（默认官方目录顺序，排序只影响浏览）。</p>"
+            "<table id=\"gw-models\"><tr>" + ths + "</tr>" +
+            "".join(trs) + "</table>"
+            "<script>\n"
+            "function gwSort(th) {\n"
+            "  var table = th.closest('table');\n"
+            "  var rows = Array.prototype.slice.call(table.rows, 1);\n"
+            "  var idx = th.cellIndex;\n"
+            "  var type = th.getAttribute('data-type');\n"
+            "  var dir = th.getAttribute('data-dir') === 'asc' ? 'desc' : 'asc';\n"
+            "  Array.prototype.forEach.call(table.rows[0].cells, function(c) {\n"
+            "    c.setAttribute('data-dir', '');\n"
+            "    var s = c.querySelector('.sort-ind');\n"
+            "    if (s) s.textContent = '';\n"
+            "  });\n"
+            "  th.setAttribute('data-dir', dir);\n"
+            "  var ind = th.querySelector('.sort-ind');\n"
+            "  if (ind) ind.textContent = dir === 'asc' ? ' ▲' : ' ▼';\n"
+            "  function val(row) {\n"
+            "    var cell = row.cells[idx];\n"
+            "    var v = cell.getAttribute('data-v');\n"
+            "    return (v === null || v === '') ? null : v;\n"
+            "  }\n"
+            "  rows.sort(function(a, b) {\n"
+            "    var va = val(a), vb = val(b);\n"
+            "    if (va === null && vb === null) return 0;\n"
+            "    if (va === null) return 1;\n"
+            "    if (vb === null) return -1;\n"
+            "    var cmp = (type === 'num') ? (parseFloat(va) - parseFloat(vb))\n"
+            "                               : String(va).localeCompare(String(vb));\n"
+            "    return dir === 'asc' ? cmp : -cmp;\n"
+            "  });\n"
+            "  rows.forEach(function(r) { table.appendChild(r); });\n"
+            "}\n"
+            "</script></div>")
 
 
 def settings_page(msg: str = "", is_err: bool = False) -> bytes:
@@ -1542,6 +1614,85 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._send_json(outcome.status, outcome.payload)
 
+    def _v1_messages(self):
+        """POST /v1/messages（Anthropic Messages，Claude Code 用）。
+        鉴权认 Bearer 或 x-api-key；错误一律 Anthropic 形状。"""
+        def aerr(status, etype, message, extra=None):
+            return self._send_json(status, {"type": "error", "error": {
+                "type": etype, "message": message}}, extra)
+
+        if gateway is None:
+            return aerr(503, "overloaded_error", "网关模块未加载")
+        if not gateway.check_api_key(self.headers.get("Authorization") or "",
+                                     self.headers.get("x-api-key") or ""):
+            return aerr(401, "authentication_error", "API 密钥无效")
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n > 0 else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return aerr(400, "invalid_request_error", "请求体不是合法 JSON")
+        try:
+            outcome = gateway.messages(AccountStore(), body,
+                                       self.headers.get("X-Session-Id"))
+        except Exception as e:  # noqa: BLE001
+            return aerr(500, "api_error", f"网关内部错误：{e}")
+        if outcome.kind == "stream":
+            self.send_response(outcome.status)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                for chunk in outcome.payload:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        return self._send_json(outcome.status, outcome.payload)
+
+    def _v1_responses(self):
+        """POST /v1/responses（OpenAI Responses，Codex 用）。
+        鉴权认 Bearer 或 x-api-key；错误用 OpenAI 形状。"""
+        if gateway is None:
+            return self._send_json(503, {"error": {
+                "message": "网关模块未加载", "type": "server_error",
+                "code": "gateway_unavailable"}})
+        if not gateway.check_api_key(self.headers.get("Authorization") or "",
+                                     self.headers.get("x-api-key") or ""):
+            return self._send_json(401, {"error": {
+                "message": "API 密钥无效", "type": "authentication_error",
+                "code": "invalid_api_key"}},
+                {"WWW-Authenticate": "Bearer"})
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n > 0 else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send_json(400, {"error": {
+                "message": "请求体不是合法 JSON", "type": "invalid_request_error",
+                "code": "bad_json"}})
+        try:
+            outcome = gateway.responses(AccountStore(), body,
+                                        self.headers.get("X-Session-Id"))
+        except Exception as e:  # noqa: BLE001
+            return self._send_json(500, {"error": {
+                "message": f"网关内部错误：{e}", "type": "server_error",
+                "code": "gateway_internal"}})
+        if outcome.kind == "stream":
+            self.send_response(outcome.status)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                for chunk in outcome.payload:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        return self._send_json(outcome.status, outcome.payload)
+
     def _cookie_token(self) -> str | None:
         for part in (self.headers.get("Cookie") or "").split(";"):
             part = part.strip()
@@ -1751,6 +1902,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/v1/chat/completions":
             return self._v1_chat()
+        if u.path == "/v1/messages":
+            return self._v1_messages()
+        if u.path == "/v1/responses":
+            return self._v1_responses()
         if u.path == "/oos/upload":
             return self._oos_upload()
         form = self._form()

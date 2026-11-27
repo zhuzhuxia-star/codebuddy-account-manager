@@ -380,5 +380,43 @@ html = server.dashboard().decode("utf-8")
 check("仪表盘有网关池开关", "/account/pool" in html and "网关池" in html)
 httpd.shutdown()
 
+# ---------- 12. 模型名口径：官方原名原样透传，不改写（二期口径） ----------
+print("[12] 模型名原样透传")
+
+seen_models = []
+
+
+def open_capture(auth, uid, ent, payload, conv_id):
+    seen_models.append(payload.get("model"))
+    return 200, FakeResp(sse(["R"])), b""
+
+
+gateway._open_chat = open_capture
+route_store = FakeStore([make_rec("uR", "路由", "tok-R", "ref-R")])
+
+seen_models.clear()
+out = gateway.chat(route_store,
+                   {"model": "glm-5.3-flash",
+                    "messages": [{"role": "user", "content": "全名直通"}]}, None)
+check("目录全名原样透传", seen_models == ["glm-5.3-flash"] and out.status == 200,
+      str(seen_models))
+
+seen_models.clear()
+out = gateway.chat(route_store,
+                   {"model": "5.3-flash",
+                    "messages": [{"role": "user", "content": "短名不改写"}]}, None)
+check("短名也不改写（官方什么样就什么样）", seen_models == ["5.3-flash"],
+      str(seen_models))
+check("响应 model 与请求一致", out.payload.get("model") == "5.3-flash",
+      str(out.payload.get("model")))
+
+seen_models.clear()
+out = gateway.chat(route_store,
+                   {"model": "nope-9",
+                    "messages": [{"role": "user", "content": "未知模型"}]}, None)
+check("未知模型名原样透传", seen_models == ["nope-9"], str(seen_models))
+
+gateway._open_chat = orig_open
+
 print(f"\n结果：PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)
