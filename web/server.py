@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -440,19 +441,46 @@ def esc(s) -> str:
     return html.escape(str(s if s is not None else ""), quote=True)
 
 
-# ---- 页面展示基地址：以浏览器地址栏（当前请求 Host）为准 ----
-# 用户规矩（2026-11-27 新定，取代 2026-11-26「/oos 短链写死正式域名」
-# 的旧口径）：页面上展示的所有域名/接口地址都用用户打开面板时的地址
-# ——用哪个域名（或沙盒直达地址）打开，页面里的端点、接入地址、curl
-# 示例、分享短链就拼哪个。Handler 在每个请求开头把 Host 记进线程局部，
-# 页面函数用 display_base() 取；没有请求上下文（脚本/测试直调页面
-# 函数）或 Host 形状非法时回落正式域名。本站入站不做任何 Host 校验，
-# 任何 Host 都正常服务（多域名可用性靠相对跳转 + host-only Cookie）。
+# ---- 页面展示基地址：只展示用户自己的域名，绝不印容器原生地址 ----
+# 用户规矩（2026-11-27 二次修正，取代同日早先「展示随请求 Host 变」的
+# 口径）：页面上展示的所有域名/接口地址用他自己的域名。当前请求 Host
+# 是他自己的域名（koi.ipv64.de、sms.dcio.eu.org，或以后任何非容器原生
+# 的域名）就用当前 Host；Host 是容器原生地址（*.tryaltare.ai /
+# *.altare.global，带不带端口都算）或 localhost/纯 IP/空/非法等没有
+# 自有域名上下文的情况，一律回落主展示域名 ——设备配置不能绑死在容器
+# 地址上，容器出问题他的域名还能改指向。Handler 在每个请求开头把 Host
+# 记进线程局部，页面函数用 display_base() 取。本站入站不做任何 Host
+# 校验，任何 Host 都正常服务（多域名可用性靠相对跳转 + host-only
+# Cookie）；本节只决定页面上印什么地址，不影响服务行为。
 _req_ctx = threading.local()
-DISPLAY_BASE_FALLBACK = "https://koi.ipv64.de"
+# 主展示域名：没有自有域名上下文（容器原生地址/localhost/纯 IP/无请求
+# 上下文）时，所有页面展示地址一律用它。
+DISPLAY_BASE_PRIMARY = "https://koi.ipv64.de"
 _HOST_OK = re.compile(
     r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9.\-]*[A-Za-z0-9])?(:\d{1,5})?$"
     r"|^\[[0-9A-Fa-f:]+\](:\d{1,5})?$")
+# 容器原生地址后缀：属于平台容器、不是用户的域名，绝不印上页面。
+_CONTAINER_HOST_SUFFIXES = (".tryaltare.ai", ".altare.global")
+
+
+def _own_display_host(host: str):
+    """把请求 Host 归一成可展示的自有域名 Host（带端口原文返回）；
+    容器原生地址 / localhost / 纯 IP 返回 None（→ 回落主展示域名）。"""
+    if host.startswith("["):  # [IPv6](:port)? —— 纯 IP，无域名上下文
+        return None
+    name = host.rsplit(":", 1)[0] if ":" in host else host
+    low = name.lower()
+    if low == "localhost" or low.endswith(".localhost"):
+        return None
+    try:
+        ipaddress.ip_address(low)
+        return None  # 纯 IP，无域名上下文
+    except ValueError:
+        pass
+    for suf in _CONTAINER_HOST_SUFFIXES:
+        if low == suf[1:] or low.endswith(suf):
+            return None
+    return host
 
 
 def set_display_host(host) -> None:
@@ -463,10 +491,11 @@ def set_display_host(host) -> None:
 
 
 def display_base() -> str:
-    """页面展示用的本站基地址：https://<当前请求 Host>；无上下文回落
-    正式域名。"""
+    """页面展示用的本站基地址：当前 Host 是用户自有域名时用它；容器
+    原生地址 / localhost / 纯 IP / 无上下文时回落主展示域名。"""
     host = getattr(_req_ctx, "host", None)
-    return f"https://{host}" if host else DISPLAY_BASE_FALLBACK
+    own = _own_display_host(host) if host else None
+    return f"https://{own}" if own else DISPLAY_BASE_PRIMARY
 
 
 def page(title: str, body: str, msg: str = "", is_err: bool = False) -> bytes:

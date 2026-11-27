@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
-"""多域名可用性 + 展示随 Host 变 夹具测试（真实起 HTTP 服务全链路）。
+"""多域名可用性 + 展示域名口径 夹具测试（真实起 HTTP 服务全链路）。
 
-用户规矩（2026-11-27）：页面展示的所有域名/接口以浏览器地址栏为准；
-且接口本身在任何映射到本站的域名下都要能正常请求。覆盖：
-[1] 展示随 Host：设置页端点、/fleet 接入地址与 curl 示例、/oos 分享
-    短链，分别用三个 Host 渲染，都拼当前 Host；非正式域名的 Host 下
-    页面里不出现写死的正式域名。
+用户规矩（2026-11-27 二次修正）：页面展示的所有域名/接口只用他自己
+的域名——当前 Host 是自有域名（koi.ipv64.de、sms.dcio.eu.org 或其他
+非容器原生域名）就展示当前 Host；Host 是容器原生地址
+（*.tryaltare.ai / *.altare.global）或 localhost/纯 IP 时一律回落主
+展示域名 koi.ipv64.de，页面上绝不出现容器原生地址。且接口本身在任何
+映射到本站的域名下都要能正常请求。覆盖：
+[1] 展示口径：设置页端点、/fleet 接入地址与 curl 示例、/oos 分享短链
+    按上表渲染；原生 Host 下三页无 tryaltare/altare.global 字样，非主
+    域名自有 Host 下三页无写死的主展示域名。
 [2] 双 Host 全链路：两个不同 Host 分别跑登录（断言跳转相对、Cookie
     无 Domain 属性即 host-only）、未登录跳转相对、一次 chat 调用、
     一次心跳上报、一次 /v1/models、一次短链访问（就地出内容不跳转）。
-[3] 回落与净化：无 Host 上下文 / 空 / 非法形状的 Host → 回落正式域名。
+[3] 回落与净化：无 Host 上下文 / 空 / 非法形状 / 容器原生 / localhost /
+    纯 IP 的 Host → 回落主展示域名；自有域名 Host 原样生效。
 运行：python3 test_hostbase.py"""
 import copy
 import hashlib
@@ -155,6 +160,8 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 HOST_A = "koi.ipv64.de"
 HOST_B = "se-sto11.tryaltare.ai:25536"
 HOST_C = "example.test"
+HOST_SMS = "sms.dcio.eu.org"
+HOST_ALT = "sg-sgp06.altare.global"
 KOI = "koi.ipv64.de"
 
 
@@ -182,43 +189,50 @@ def login(host):
     return st, hdrs, cookie
 
 
-# ---------- [1] 展示随 Host ----------
-print("[1] 展示随 Host 变")
+# ---------- [1] 展示口径：自有域名用当前 Host，容器原生回落主域名 ----------
+print("[1] 展示口径（自有域名随 Host / 容器原生回落主展示域名）")
 _, _, cookie_a = login(HOST_A)
 sess = cookie_a.split(";")[0]
-for host in (HOST_A, HOST_B, HOST_C):
+# (请求 Host, 期望展示的 Host)：自有域名 → 当前 Host；容器原生 → KOI
+DISPLAY_CASES = [
+    (HOST_A, HOST_A),
+    (HOST_SMS, HOST_SMS),
+    (HOST_C, HOST_C),
+    (HOST_B, KOI),
+    (HOST_ALT, KOI),
+]
+for host, disp in DISPLAY_CASES:
     st, _, html = req("GET", "/settings",
                       headers={"Cookie": sess, "Host": host})
-    check(f"[{host}] 设置页 Base URL 随 Host",
-          f"<code>https://{host}/v1</code>" in html)
-    check(f"[{host}] 设置页 models 端点随 Host",
-          f"GET https://{host}/v1/models" in html)
-    check(f"[{host}] 设置页 chat 端点随 Host",
-          f"POST https://{host}/v1/chat/completions" in html)
+    check(f"[{host}] 设置页 Base URL 展示 {disp}",
+          f"<code>https://{disp}/v1</code>" in html)
+    check(f"[{host}] 设置页 models 端点展示 {disp}",
+          f"GET https://{disp}/v1/models" in html)
+    check(f"[{host}] 设置页 chat 端点展示 {disp}",
+          f"POST https://{disp}/v1/chat/completions" in html)
+    s_html = html
     st, _, html = req("GET", "/fleet",
                       headers={"Cookie": sess, "Host": host})
-    check(f"[{host}] fleet 心跳地址随 Host",
-          f"POST https://{host}/api/v1/heartbeat" in html)
-    check(f"[{host}] fleet 短信地址随 Host",
-          f"POST https://{host}/api/v1/sms" in html)
-    check(f"[{host}] fleet curl 示例随 Host",
-          f"curl -X POST https://{host}/api/v1/heartbeat" in html
-          and f"curl -X POST https://{host}/api/v1/sms" in html)
+    check(f"[{host}] fleet 心跳地址展示 {disp}",
+          f"POST https://{disp}/api/v1/heartbeat" in html)
+    check(f"[{host}] fleet 短信地址展示 {disp}",
+          f"POST https://{disp}/api/v1/sms" in html)
+    check(f"[{host}] fleet curl 示例展示 {disp}",
+          f"curl -X POST https://{disp}/api/v1/heartbeat" in html
+          and f"curl -X POST https://{disp}/api/v1/sms" in html)
+    f_html = html
     st, _, html = req("GET", "/oos/link?key=docs/hello.txt",
                       headers={"Cookie": sess, "Host": host})
-    check(f"[{host}] 分享短链随 Host",
-          f"https://{host}/oos/s/{SHORT_CODE}" in html)
-    if host != KOI:
-        check(f"[{host}] 短链页无写死正式域名", KOI not in html)
-
-# 非 koi Host 下设置页与 fleet 页也不出现写死域名（逐页单独断言）
-for host in (HOST_B, HOST_C):
-    _, _, s_html = req("GET", "/settings",
-                       headers={"Cookie": sess, "Host": host})
-    _, _, f_html = req("GET", "/fleet",
-                       headers={"Cookie": sess, "Host": host})
-    check(f"[{host}] 设置页无写死正式域名", KOI not in s_html)
-    check(f"[{host}] fleet 页无写死正式域名", KOI not in f_html)
+    check(f"[{host}] 分享短链展示 {disp}",
+          f"https://{disp}/oos/s/{SHORT_CODE}" in html)
+    o_html = html
+    if disp != KOI:
+        check(f"[{host}] 三页无写死主展示域名",
+              KOI not in s_html and KOI not in f_html and KOI not in o_html)
+    if host in (HOST_B, HOST_ALT):
+        check(f"[{host}] 三页无容器原生地址字样",
+              "tryaltare" not in s_html + f_html + o_html
+              and "altare.global" not in s_html + f_html + o_html)
 
 # ---------- [2] 双 Host 全链路 ----------
 print("[2] 双 Host 全链路可用")
@@ -273,10 +287,10 @@ for host in (HOST_A, HOST_B):
 # ---------- [3] 回落与净化（直调函数） ----------
 print("[3] 回落与净化")
 server.set_display_host(None)
-check("无 Host 上下文回落正式域名",
+check("无 Host 上下文回落主展示域名",
       server.display_base() == "https://koi.ipv64.de",
       server.display_base())
-check("回落时参考区端点为正式域名",
+check("回落时参考区端点为主展示域名",
       "<code>https://koi.ipv64.de/v1</code>" in server._gw_info_html())
 server.set_display_host("")
 check("空 Host 回落", server.display_base() == "https://koi.ipv64.de")
@@ -285,7 +299,35 @@ check("非法 Host 被净化回落",
       server.display_base() == "https://koi.ipv64.de",
       server.display_base())
 server.set_display_host("example.test")
-check("合法 Host 生效", server.display_base() == "https://example.test")
+check("合法自有域名 Host 生效", server.display_base() == "https://example.test")
+server.set_display_host("sms.dcio.eu.org")
+check("sms 自有域名生效",
+      server.display_base() == "https://sms.dcio.eu.org",
+      server.display_base())
+server.set_display_host("se-sto11.tryaltare.ai:25536")
+check("tryaltare 容器地址（带端口）回落主展示域名",
+      server.display_base() == "https://koi.ipv64.de",
+      server.display_base())
+server.set_display_host("se-sto11.tryaltare.ai")
+check("tryaltare 容器地址（无端口）回落主展示域名",
+      server.display_base() == "https://koi.ipv64.de",
+      server.display_base())
+server.set_display_host("sg-sgp06.altare.global")
+check("altare.global 容器地址回落主展示域名",
+      server.display_base() == "https://koi.ipv64.de",
+      server.display_base())
+server.set_display_host("127.0.0.1:25536")
+check("纯 IPv4 Host 回落主展示域名",
+      server.display_base() == "https://koi.ipv64.de",
+      server.display_base())
+server.set_display_host("localhost:8080")
+check("localhost 回落主展示域名",
+      server.display_base() == "https://koi.ipv64.de",
+      server.display_base())
+server.set_display_host("[::1]:8080")
+check("IPv6 Host 回落主展示域名",
+      server.display_base() == "https://koi.ipv64.de",
+      server.display_base())
 server.set_display_host(None)
 
 srv.shutdown()
