@@ -208,7 +208,7 @@ devs = {x["imei"]: x for x in fleet.list_devices()}
 check("心跳 type 入库", devs[IMEI].get("type") == "手机",
       str(devs[IMEI].get("type")))
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
-check("设备表有类型/备注列", "<th>类型</th>" in htmltxt
+check("设备表有类型/备注列", ">类型</a>" in htmltxt
       and "<th>备注</th>" in htmltxt)
 check("类型值渲染", "<td>手机</td>" in htmltxt)
 
@@ -334,6 +334,270 @@ check("关键词搜内容", "分页短信-B-" in htmltxt
 st, _, htmltxt = req("GET", "/fleet?sq=95588", headers={"Cookie": sess})
 check("关键词搜发送方", "银行动账提醒" in htmltxt
       and "共 1 条短信" in htmltxt)
+
+# ---------- 在线时长 ----------
+check("时长格式化口径",
+      fleet.fmt_duration(30) == "刚刚"
+      and fleet.fmt_duration(25 * 60) == "25分钟"
+      and fleet.fmt_duration(2 * 3600 + 15 * 60) == "2小时15分"
+      and fleet.fmt_duration(3 * 86400 + 4 * 3600) == "3天4小时",
+      fleet.fmt_duration(2 * 3600 + 15 * 60))
+IMEI2 = "860000000000777"
+t0 = time.time()
+st, _, _ = req("POST", "/api/v1/heartbeat",
+               {"imei": IMEI2, "online": True, "phone": "13600000000"}, KEY_H)
+check("在线时长设备心跳 200", st == 200)
+devs = {x["imei"]: x for x in fleet.list_devices()}
+d2 = devs.get(IMEI2) or {}
+check("首次上线打 online_since",
+      d2.get("online_since") is not None
+      and abs(d2["online_since"] - t0) < 5, str(d2.get("online_since")))
+check("刚上线时长显示刚刚", d2.get("online_duration") == "刚刚",
+      str(d2.get("online_duration")))
+since1 = d2["online_since"]
+time.sleep(1.1)
+req("POST", "/api/v1/heartbeat", {"imei": IMEI2, "online": True}, KEY_H)
+devs = {x["imei"]: x for x in fleet.list_devices()}
+check("持续在线不重置 online_since",
+      devs[IMEI2].get("online_since") == since1,
+      f"{since1} -> {devs[IMEI2].get('online_since')}")
+req("POST", "/api/v1/heartbeat", {"imei": IMEI2, "online": False}, KEY_H)
+devs = {x["imei"]: x for x in fleet.list_devices()}
+d2 = devs[IMEI2]
+check("报离线清空 online_since", d2.get("online_since") is None)
+check("离线设备时长显示 —", d2.get("online_duration") == "—",
+      str(d2.get("online_duration")))
+req("POST", "/api/v1/heartbeat", {"imei": IMEI2, "online": True}, KEY_H)
+devs = {x["imei"]: x for x in fleet.list_devices()}
+since2 = devs[IMEI2].get("online_since")
+check("离线后重新上线重新打点", since2 is not None and since2 > since1)
+conn = sqlite3.connect(str(fleet.DB_FILE))
+conn.execute("UPDATE devices SET last_seen=?, online_since=? WHERE imei=?",
+             (time.time() - 1000, time.time() - 1000, IMEI2))
+conn.commit()
+conn.close()
+t1 = time.time()
+req("POST", "/api/v1/heartbeat", {"imei": IMEI2, "online": True}, KEY_H)
+devs = {x["imei"]: x for x in fleet.list_devices()}
+since3 = devs[IMEI2].get("online_since")
+check("心跳超时后再上线重新计时",
+      since3 is not None and since3 > since2 and abs(since3 - t1) < 5,
+      f"{since2} -> {since3}")
+conn = sqlite3.connect(str(fleet.DB_FILE))
+conn.execute("UPDATE devices SET online_since=? WHERE imei=?",
+             (time.time() - (2 * 3600 + 15 * 60), IMEI2))
+conn.commit()
+conn.close()
+devs = {x["imei"]: x for x in fleet.list_devices()}
+check("在线时长人话显示", devs[IMEI2].get("online_duration") == "2小时15分",
+      str(devs[IMEI2].get("online_duration")))
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("设备表有在线时长列", ">在线时长</a>" in htmltxt)
+check("页面渲染在线时长", "2小时15分" in htmltxt)
+
+# ---------- 短信双时间列（上传时间 / 短信时间） ----------
+past_ts_ms = int((time.time() - 7200) * 1000)
+st, _, _ = req("POST", "/api/v1/sms",
+               {"imei": IMEI, "from": "10086", "content": "双时间列校验短信",
+                "ts": past_ts_ms}, KEY_H)
+check("双时间短信入库", st == 200)
+rec = next((m for m in fleet.list_sms()
+            if m["content"] == "双时间列校验短信"), None)
+check("双时间记录存在", rec is not None)
+up_s = fleet.fmt_ts(rec["received_at"]) if rec else ""
+dev_s = fleet.fmt_ts(rec["device_ts"]) if rec else ""
+check("上传/短信时间确实不同", bool(rec) and up_s != dev_s,
+      f"{up_s} vs {dev_s}")
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("短信表有双时间列头", ">上传时间 ▼</a>" in htmltxt
+      and ">短信时间</a>" in htmltxt)
+pos = htmltxt.find("双时间列校验短信")
+seg = htmltxt[max(0, pos - 800):pos] if pos >= 0 else ""
+check("行内上传时间在前、短信时间在后",
+      bool(seg) and 0 <= seg.find(up_s) < seg.find(dev_s),
+      f"up@{seg.find(up_s)} dev@{seg.find(dev_s)}")
+
+# ---------- 表头排序（服务端） ----------
+S1, S2, S3 = "860000000000901", "860000000000902", "860000000000903"
+base_t = time.time()
+fleet.heartbeat({"imei": S1, "phone": "13711111111", "type": "平板",
+                 "online": True})
+fleet.heartbeat({"imei": S2, "phone": "13722222222", "type": "手机",
+                 "online": True})
+fleet.heartbeat({"imei": S3, "phone": "13733333333", "type": "网关",
+                 "online": False})
+conn = sqlite3.connect(str(fleet.DB_FILE))
+conn.execute("UPDATE devices SET last_seen=?, online_since=?"
+             " WHERE imei=?", (base_t - 10, base_t - 3600, S1))
+conn.execute("UPDATE devices SET last_seen=?, online_since=?"
+             " WHERE imei=?", (base_t - 20, base_t - 60, S2))
+conn.execute("UPDATE devices SET last_seen=?, online_since=NULL"
+             " WHERE imei=?", (base_t - 30, S3))
+conn.commit()
+conn.close()
+
+
+def dev_order(sort, order):
+    rows, _ = fleet.list_devices_page(1, 100, sort=sort, order=order)
+    return [r["imei"] for r in rows]
+
+
+def rel(seq, *items):
+    idx = [seq.index(i) for i in items]
+    return idx == sorted(idx)
+
+
+check("设备按手机号升序", rel(dev_order("phone", "asc"), S1, S2, S3))
+check("设备按手机号降序", rel(dev_order("phone", "desc"), S3, S2, S1))
+check("设备按类型升序", rel(dev_order("type", "asc"), S1, S2, S3))
+_od = dev_order("status", "desc")
+check("设备按状态降序在线在前", rel(_od, S1, S3) and rel(_od, S2, S3))
+_oa = dev_order("status", "asc")
+check("设备按状态升序离线在前", rel(_oa, S3, S1) and rel(_oa, S3, S2))
+check("设备默认最后心跳降序", rel(dev_order("last_seen", "desc"),
+                                  S1, S2, S3))
+check("设备最后心跳升序", rel(dev_order("last_seen", "asc"), S3, S2, S1))
+check("在线时长降序长者在前离线沉底",
+      rel(dev_order("duration", "desc"), S1, S2, S3))
+_oa = dev_order("duration", "asc")
+check("在线时长升序短者在前离线仍沉底",
+      rel(_oa, S2, S1) and _oa.index(S3) > _oa.index(S1))
+
+fleet.record_sms({"imei": S1, "from": "10086", "content": "排序短信甲"})
+fleet.record_sms({"imei": S2, "from": "10010", "content": "排序短信乙"})
+fleet.record_sms({"imei": IMEI, "from": "95588", "content": "排序短信丙"})
+conn = sqlite3.connect(str(fleet.DB_FILE))
+for content, recv, dts in (("排序短信甲", base_t - 100, base_t - 500),
+                           ("排序短信乙", base_t - 50, base_t - 900),
+                           ("排序短信丙", base_t - 10, base_t - 100)):
+    conn.execute("UPDATE sms SET received_at=?, device_ts=?"
+                 " WHERE content=?", (recv, dts, content))
+conn.commit()
+conn.close()
+
+
+def sms_order(sort, order):
+    rows, _ = fleet.list_sms_page(1, 100, keyword="排序短信",
+                                  sort=sort, order=order)
+    return [r["content"] for r in rows]
+
+
+check("短信默认上传时间降序",
+      sms_order("received", "desc")
+      == ["排序短信丙", "排序短信乙", "排序短信甲"],
+      str(sms_order("received", "desc")))
+check("短信上传时间升序",
+      sms_order("received", "asc")
+      == ["排序短信甲", "排序短信乙", "排序短信丙"])
+check("短信按短信时间降序",
+      sms_order("device_ts", "desc")
+      == ["排序短信丙", "排序短信甲", "排序短信乙"],
+      str(sms_order("device_ts", "desc")))
+check("短信按发送方升序",
+      sms_order("sender", "asc")
+      == ["排序短信乙", "排序短信甲", "排序短信丙"],
+      str(sms_order("sender", "asc")))
+check("短信按设备升序",
+      sms_order("device", "asc")
+      == ["排序短信甲", "排序短信乙", "排序短信丙"],
+      str(sms_order("device", "asc")))
+
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("默认设备表头最后心跳带 ▼", ">最后心跳 ▼</a>" in htmltxt)
+check("可排序表头是链接", "dsort=phone" in htmltxt
+      and "ssort=sender" in htmltxt)
+st, _, htmltxt = req("GET", "/fleet?dsort=phone&dorder=asc",
+                     headers={"Cookie": sess})
+check("手机号当前列带 ▲", ">手机号 ▲</a>" in htmltxt)
+_i = htmltxt.find(">手机号 ▲</a>")
+_href_seg = htmltxt[max(0, _i - 80):_i] if _i >= 0 else ""
+check("点当前列切换为降序（链接不再带升序）",
+      "dsort=phone" in _href_seg and "dorder=asc" not in _href_seg,
+      _href_seg)
+check("页面按手机号升序排列",
+      htmltxt.find("13711111111") < htmltxt.find("13722222222")
+      < htmltxt.find("13733333333"))
+st, _, htmltxt = req("GET", "/fleet?dsort=phone&dorder=asc&dpage=2",
+                     headers={"Cookie": sess})
+check("翻页后排序保持", ">手机号 ▲</a>" in htmltxt
+      and "dsort=phone" in htmltxt)
+st, _, htmltxt = req("GET", "/fleet?ssort=sender&sorder=asc&sq="
+                     + urllib.parse.quote("排序短信"),
+                     headers={"Cookie": sess})
+check("发送方当前列带 ▲", ">发送方 ▲</a>" in htmltxt)
+check("筛选下按发送方升序排列",
+      htmltxt.find("排序短信乙") < htmltxt.find("排序短信甲")
+      < htmltxt.find("排序短信丙"))
+st, _, htmltxt = req("GET", "/fleet?ssort=sender&sorder=asc&spage=2",
+                     headers={"Cookie": sess})
+check("短信翻页后排序保持", ">发送方 ▲</a>" in htmltxt)
+
+# ---------- 改接入密钥：自定义 ----------
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("改密钥表单存在", "/fleet/key/update" in htmltxt
+      and "/fleet/key/rotate" in htmltxt and "保存新密钥" in htmltxt
+      and "随机换一把" in htmltxt
+      and "旧密钥立即失效" in htmltxt)
+NEW_KEY = "my-custom-key_2026!"
+st, hdrs, _ = form_post("/fleet/key/update", {"new_key": NEW_KEY}, sess)
+check("自定义改密钥 303 跳回", st == 303
+      and "/fleet" in (hdrs.get("Location") or ""), f"{st}")
+check("改后当前密钥是新值", fleet.key_plain() == NEW_KEY)
+conf_file = json.loads((DATA_DIR / "fleet.json").read_text(encoding="utf-8"))
+check("fleet.json 明文与哈希同步",
+      conf_file.get("key_plain") == NEW_KEY
+      and conf_file.get("key_hash")
+      == hashlib.sha256(NEW_KEY.encode("utf-8")).hexdigest())
+st, _, _ = req("POST", "/api/v1/heartbeat", {"imei": IMEI}, KEY_H)
+check("改密钥后旧密钥心跳 401", st == 401)
+st, _, _ = req("POST", "/api/v1/heartbeat", {"imei": IMEI},
+               {"X-Device-Key": NEW_KEY})
+check("新密钥心跳 200", st == 200)
+st, _, _ = req("POST", "/api/v1/sms", {"imei": IMEI, "content": "新密钥短信"},
+               {"Authorization": "Bearer " + NEW_KEY})
+check("新密钥 Bearer 短信 200", st == 200)
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("页面显示新密钥明文", NEW_KEY in htmltxt)
+
+# ---------- 改接入密钥：不合格被拒 ----------
+for bad, why in (("short", "太短"), ("has space99", "带空格"),
+                 ("含中文的密钥abcd1234", "非 ASCII"),
+                 ("with\"quote99", "带引号")):
+    st, hdrs, _ = form_post("/fleet/key/update", {"new_key": bad}, sess)
+    check(f"不合格密钥被拒（{why}）", "err=1" in (hdrs.get("Location") or ""),
+          hdrs.get("Location") or "")
+check("被拒后密钥未变", fleet.key_plain() == NEW_KEY)
+st, _, _ = req("POST", "/api/v1/heartbeat", {"imei": IMEI},
+               {"X-Device-Key": NEW_KEY})
+check("被拒后旧密钥仍可用", st == 200)
+
+# ---------- 改接入密钥：随机更换 ----------
+st, hdrs, _ = form_post("/fleet/key/rotate", {}, sess)
+check("随机更换 303 跳回", st == 303
+      and "/fleet" in (hdrs.get("Location") or ""), f"{st}")
+rotated = fleet.key_plain()
+check("随机新密钥 sk-fleet- 前缀且已换",
+      rotated.startswith("sk-fleet-") and rotated != NEW_KEY,
+      rotated[:12])
+st, _, _ = req("POST", "/api/v1/heartbeat", {"imei": IMEI},
+               {"X-Device-Key": NEW_KEY})
+check("随机更换后旧密钥 401", st == 401)
+st, _, _ = req("POST", "/api/v1/heartbeat", {"imei": IMEI},
+               {"X-Device-Key": rotated})
+check("随机更换后新密钥 200", st == 200)
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("页面显示随机新密钥", rotated in htmltxt)
+
+# ---------- 改接入密钥：未登录被挡 ----------
+st, hdrs, _ = form_post("/fleet/key/update",
+                        {"new_key": "another-key-123"}, "")
+check("未登录改密钥跳登录", st == 303
+      and "/login" in (hdrs.get("Location") or ""),
+      f"{st} {hdrs.get('Location')}")
+st, hdrs, _ = form_post("/fleet/key/rotate", {}, "")
+check("未登录随机更换跳登录", st == 303
+      and "/login" in (hdrs.get("Location") or ""))
+check("未登录尝试未改掉密钥", fleet.key_plain() == rotated)
 
 srv.shutdown()
 print(f"\n== fleet: {PASS} passed, {FAIL} failed ==")

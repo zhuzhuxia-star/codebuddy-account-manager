@@ -4,12 +4,17 @@
 与网关（gateway.py）平级、互不干扰：
   - 接入密钥单独一把，存 DATA_DIR/fleet.json（权限 0600，明文只在
     服务端与管理页出现），服务端另存 sha256 哈希校验。请求带
-    X-Device-Key 头，或 Authorization: Bearer <key>。
+    X-Device-Key 头，或 Authorization: Bearer <key>。管理页可自定义
+    改密钥或随机换一把，换后旧密钥立即失效。
   - IMEI 即设备身份（本轮不做逐设备密钥）。
   - 存储 DATA_DIR/fleet.db（SQLite）：devices / sms 两张表。
   - 短信只保留 SMS_TTL 秒（1 小时）：读列表与新短信入库时顺带清理
     过期短信，管理页也可手动删单条 / 清空全部。
   - 设备可由管理页编辑手机号 / 类型 / 备注（type 也可随心跳上报）。
+  - 设备记 online_since（本次连续在线的起始时间）：从离线转在线时
+    打点、持续在线不刷新、上报离线时清空，页面据此显示「在线时长」。
+  - 短信时间分两列：上传时间 = received_at（服务器收到时间）、
+    短信时间 = device_ts（设备上报的短信时间，没报 ts 时与上传相同）。
 
 在线判定：last_seen 在 ONLINE_WINDOW 秒内且最近一次上报 online=true。
 """
@@ -18,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -38,16 +44,8 @@ _key_lock = threading.Lock()
 _db_lock = threading.Lock()
 
 
-def _key_conf(create: bool = False) -> dict:
-    try:
-        data = json.loads(KEY_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("key_plain"):
-            return data
-    except Exception:
-        pass
-    if not create:
-        return {}
-    plain = "sk-fleet-" + secrets.token_urlsafe(32)
+def _save_key(plain: str) -> dict:
+    """把接入密钥明文 + sha256 哈希落盘 fleet.json（0600），返回配置。"""
     conf = {
         "key_plain": plain,
         "key_hash": hashlib.sha256(plain.encode("utf-8")).hexdigest(),
@@ -61,6 +59,18 @@ def _key_conf(create: bool = False) -> dict:
     except Exception:
         pass
     return conf
+
+
+def _key_conf(create: bool = False) -> dict:
+    try:
+        data = json.loads(KEY_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("key_plain"):
+            return data
+    except Exception:
+        pass
+    if not create:
+        return {}
+    return _save_key("sk-fleet-" + secrets.token_urlsafe(32))
 
 
 def ensure_key() -> str:
@@ -99,6 +109,41 @@ def check_key(device_key_header: str, authorization_header: str) -> bool:
     return False
 
 
+# 自定义密钥只允许常见可见 ASCII：字母、数字与 -_.!@#$%^&*+=:;,?~/| 等符号。
+_KEY_RE = re.compile(r"^[A-Za-z0-9\-_.!@#$%^&*+=:;,?~/|]+$")
+
+
+def validate_new_key(v) -> str:
+    """校验管理页自定义的新接入密钥：合格返回 ''，不合格返回中文原因。"""
+    if not isinstance(v, str):
+        return "密钥格式不对"
+    v = v.strip()
+    if len(v) < 8:
+        return "至少 8 位"
+    if any(c.isspace() for c in v):
+        return "不能含空白字符"
+    if not _KEY_RE.match(v):
+        return "只能用字母、数字和常见符号（-_.!@#$%^&*+=:;,?~/|）"
+    return ""
+
+
+def set_custom_key(v) -> tuple:
+    """管理页设置自定义接入密钥：校验通过才落盘（明文+哈希同步），
+    旧密钥立即失效；校验失败不改变现有密钥。返回 (是否成功, 失败原因)。"""
+    err = validate_new_key(v)
+    if err:
+        return False, err
+    with _key_lock:
+        _save_key(v.strip())
+    return True, ""
+
+
+def rotate_key() -> str:
+    """随机换一把接入密钥（sk-fleet- 前缀），旧密钥立即失效，返回新明文。"""
+    with _key_lock:
+        return _save_key("sk-fleet-" + secrets.token_urlsafe(32))["key_plain"]
+
+
 # ---------- 存储 ----------
 def _db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -108,12 +153,15 @@ def _db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS devices("
         "imei TEXT PRIMARY KEY, phone TEXT, online_reported INTEGER DEFAULT 0,"
         "last_seen REAL, model TEXT, battery TEXT, app_version TEXT)")
-    # 迁移：老库补 type（设备类型）/ remark（备注）两列，已有数据不动。
+    # 迁移：老库补 type（设备类型）/ remark（备注）/ online_since
+    # （本次连续在线的起始时间）三列，已有数据不动。
     cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)")}
     if "type" not in cols:
         conn.execute("ALTER TABLE devices ADD COLUMN type TEXT")
     if "remark" not in cols:
         conn.execute("ALTER TABLE devices ADD COLUMN remark TEXT")
+    if "online_since" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN online_since REAL")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sms("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, imei TEXT NOT NULL,"
@@ -126,6 +174,20 @@ def fmt_ts(ts) -> str:
     if not ts:
         return "—"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+
+
+def fmt_duration(sec) -> str:
+    """秒数 → 人话时长：刚刚 / 25分钟 / 2小时15分 / 3天4小时。"""
+    sec = int(sec)
+    if sec < 60:
+        return "刚刚"
+    if sec < 3600:
+        return f"{sec // 60}分钟"
+    if sec < 86400:
+        h, m = sec // 3600, (sec % 3600) // 60
+        return f"{h}小时{m}分" if m else f"{h}小时"
+    d, h = sec // 86400, (sec % 86400) // 3600
+    return f"{d}天{h}小时" if h else f"{d}天"
 
 
 def _clean_imei(body: dict):
@@ -186,21 +248,41 @@ def _parse_device_ts(body: dict, fallback: float) -> float:
 
 # ---------- 接口 1：心跳 ----------
 def heartbeat(body: dict):
-    """POST /api/v1/heartbeat：按 imei upsert 设备记录。"""
+    """POST /api/v1/heartbeat：按 imei upsert 设备记录。
+
+    在线时长计时：online=true 且设备此前算离线（未上报在线、心跳已超
+    ONLINE_WINDOW、或还没有 online_since）时，online_since 记为本次
+    时间，重新开始计时；持续在线的心跳不刷新 online_since；
+    online=false 时清空 online_since。"""
     if not isinstance(body, dict):
         return 400, {"ok": False, "error": "请求体不是合法 JSON"}
     imei = _clean_imei(body)
     if not imei:
         return 400, {"ok": False, "error": "imei 必填"}
     now = time.time()
+    online = _parse_online(body)
     battery = body.get("battery")
     battery_s = None if battery is None else str(battery)
     with _db_lock:
         conn = _db()
         try:
+            row = conn.execute(
+                "SELECT online_reported, last_seen, online_since"
+                " FROM devices WHERE imei=?", (imei,)).fetchone()
+            if online:
+                was_offline = (
+                    row is None or not row["online_reported"]
+                    or not row["last_seen"]
+                    or (now - float(row["last_seen"])) > ONLINE_WINDOW
+                    or not row["online_since"])
+                online_since = (now if was_offline
+                                else float(row["online_since"]))
+            else:
+                online_since = None
             conn.execute(
                 "INSERT INTO devices(imei, phone, online_reported, last_seen,"
-                " model, battery, app_version, type) VALUES(?,?,?,?,?,?,?,?)"
+                " model, battery, app_version, type, online_since)"
+                " VALUES(?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(imei) DO UPDATE SET"
                 " phone=COALESCE(excluded.phone, devices.phone),"
                 " online_reported=excluded.online_reported,"
@@ -209,11 +291,13 @@ def heartbeat(body: dict):
                 " battery=COALESCE(excluded.battery, devices.battery),"
                 " app_version=COALESCE(excluded.app_version,"
                 " devices.app_version),"
-                " type=COALESCE(excluded.type, devices.type)",
+                " type=COALESCE(excluded.type, devices.type),"
+                " online_since=excluded.online_since",
                 (imei, _opt_str(body, "phone"),
-                 1 if _parse_online(body) else 0, now,
+                 1 if online else 0, now,
                  _opt_str(body, "model"), battery_s,
-                 _opt_str(body, "app_version"), _opt_str(body, "type")))
+                 _opt_str(body, "app_version"), _opt_str(body, "type"),
+                 online_since))
             conn.commit()
         finally:
             conn.close()
@@ -257,6 +341,10 @@ def _device_out(r, now: float) -> dict:
     d["online_now"] = bool(
         d.get("last_seen") and (now - float(d["last_seen"])) <= ONLINE_WINDOW
         and d.get("online_reported"))
+    since = d.get("online_since")
+    d["online_duration"] = (
+        fmt_duration(now - float(since))
+        if d["online_now"] and since else "—")
     return d
 
 
@@ -272,18 +360,46 @@ def list_devices(now: float | None = None) -> list[dict]:
     return [_device_out(r, now) for r in rows]
 
 
+def _dev_order(sort: str, order: str, now: float) -> str:
+    """设备表排序子句（服务端排序，配合分页）。order 是对该列值的
+    升/降序；文本列空值沉底；在线时长按 online_since 排（时长越长
+    since 越小），离线设备两个方向都沉底。"""
+    d = "ASC" if order == "asc" else "DESC"
+    fresh = now - ONLINE_WINDOW
+    if sort == "phone":
+        return f"ORDER BY (phone IS NULL OR phone=''), phone {d}, imei"
+    if sort == "type":
+        return f"ORDER BY (type IS NULL OR type=''), type {d}, imei"
+    if sort == "status":
+        return ("ORDER BY (CASE WHEN online_reported=1"
+                f" AND last_seen >= {fresh!r} THEN 1 ELSE 0 END) {d},"
+                " last_seen DESC")
+    if sort == "duration":
+        since_dir = "DESC" if order == "asc" else "ASC"
+        return ("ORDER BY (CASE WHEN online_reported=1"
+                f" AND last_seen >= {fresh!r}"
+                " AND online_since IS NOT NULL THEN 0 ELSE 1 END),"
+                f" online_since {since_dir}")
+    return f"ORDER BY (last_seen IS NULL), last_seen {d}"
+
+
 def list_devices_page(page: int = 1, per_page: int = PAGE_SIZE,
-                      now: float | None = None):
-    """设备分页：返回 (本页设备列表, 总数)。页码越界自动夹到有效范围。"""
+                      now: float | None = None,
+                      sort: str = "last_seen", order: str = "desc"):
+    """设备分页：返回 (本页设备列表, 总数)。页码越界自动夹到有效范围。
+    sort ∈ phone/type/status/duration/last_seen（默认最后心跳降序）。"""
     now = time.time() if now is None else now
+    if sort not in ("phone", "type", "status", "duration", "last_seen"):
+        sort = "last_seen"
+    order = "asc" if order == "asc" else "desc"
     conn = _db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
         pages = max(1, (total + per_page - 1) // per_page)
         page = min(max(1, int(page or 1)), pages)
         rows = conn.execute(
-            "SELECT * FROM devices ORDER BY (last_seen IS NULL),"
-            " last_seen DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM devices " + _dev_order(sort, order, now)
+            + " LIMIT ? OFFSET ?",
             (per_page, (page - 1) * per_page)).fetchall()
     finally:
         conn.close()
@@ -342,11 +458,31 @@ def list_sms(limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _sms_order(sort: str, order: str) -> str:
+    """短信表排序子句。设备列按页面显示值（手机号，无则 IMEI）排；
+    时间列以 id 作同值次序键，保持稳定。"""
+    d = "ASC" if order == "asc" else "DESC"
+    if sort == "device_ts":
+        return f"ORDER BY (s.device_ts IS NULL), s.device_ts {d}, s.id {d}"
+    if sort == "device":
+        return (f"ORDER BY COALESCE(NULLIF(d.phone,''), s.imei) {d},"
+                f" s.id {d}")
+    if sort == "sender":
+        return (f"ORDER BY (s.sender IS NULL OR s.sender=''),"
+                f" s.sender {d}, s.id {d}")
+    return f"ORDER BY s.received_at {d}, s.id {d}"
+
+
 def list_sms_page(page: int = 1, per_page: int = PAGE_SIZE,
-                  imei: str | None = None, keyword: str | None = None):
+                  imei: str | None = None, keyword: str | None = None,
+                  sort: str = "received", order: str = "desc"):
     """短信分页 + 筛选：imei 精确筛设备，keyword 子串匹配内容/发送方。
-    返回 (本页短信列表, 总数)；读前先清过期短信。"""
+    sort ∈ received（上传时间）/device_ts（短信时间）/device/sender，
+    默认上传时间降序。返回 (本页短信列表, 总数)；读前先清过期短信。"""
     purge_old_sms()
+    if sort not in ("received", "device_ts", "device", "sender"):
+        sort = "received"
+    order = "asc" if order == "asc" else "desc"
     where, args = [], []
     if imei:
         where.append("s.imei = ?")
@@ -365,7 +501,7 @@ def list_sms_page(page: int = 1, per_page: int = PAGE_SIZE,
         rows = conn.execute(
             "SELECT s.*, d.phone AS phone FROM sms s"
             " LEFT JOIN devices d ON d.imei = s.imei"
-            f"{wsql} ORDER BY s.id DESC LIMIT ? OFFSET ?",
+            f"{wsql} " + _sms_order(sort, order) + " LIMIT ? OFFSET ?",
             args + [per_page, (page - 1) * per_page]).fetchall()
     finally:
         conn.close()

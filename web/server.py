@@ -1055,8 +1055,11 @@ def _page_no(v) -> int:
 
 
 def _fleet_qs(dpage: int = 1, spage: int = 1, sdev: str = "",
-              sq: str = "") -> str:
-    """拼 /fleet 的查询串：只带非默认参数（页码 >1、筛选非空）。"""
+              sq: str = "", dsort: str = "", dorder: str = "",
+              ssort: str = "", sorder: str = "") -> str:
+    """拼 /fleet 的查询串：只带非默认参数（页码 >1、筛选非空、排序
+    非默认；排序默认 = 设备最后心跳降序 / 短信上传时间降序，降序为
+    默认方向故只在升序时带 dorder/sorder）。"""
     parts = []
     if dpage > 1:
         parts.append(f"dpage={dpage}")
@@ -1066,7 +1069,30 @@ def _fleet_qs(dpage: int = 1, spage: int = 1, sdev: str = "",
         parts.append("sdev=" + urllib.parse.quote(sdev, safe=""))
     if sq:
         parts.append("sq=" + urllib.parse.quote(sq, safe=""))
+    if dsort and dsort != "last_seen":
+        parts.append("dsort=" + urllib.parse.quote(dsort, safe=""))
+    if dorder == "asc":
+        parts.append("dorder=asc")
+    if ssort and ssort != "received":
+        parts.append("ssort=" + urllib.parse.quote(ssort, safe=""))
+    if sorder == "asc":
+        parts.append("sorder=asc")
     return ("?" + "&".join(parts)) if parts else ""
+
+
+def _fleet_th(label: str, key, cur_sort: str, cur_order: str,
+              href_of) -> str:
+    """可排序表头：可排序列渲染成链接，当前排序列带 ▲（升序）/
+    ▼（降序）；点当前列切换方向，点新列默认降序。key=None 不可排序。"""
+    if key is None:
+        return f"<th>{esc(label)}</th>"
+    if key == cur_sort:
+        arrow = " ▲" if cur_order == "asc" else " ▼"
+        nxt = "asc" if cur_order == "desc" else "desc"
+    else:
+        arrow, nxt = "", "desc"
+    return (f"<th><a href='{href_of(key, nxt)}'>"
+            f"{esc(label)}{arrow}</a></th>")
 
 
 def _fleet_pager(cur: int, pages: int, total: int, unit: str,
@@ -1082,11 +1108,17 @@ def _fleet_pager(cur: int, pages: int, total: int, unit: str,
 
 
 def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
-               sq: str = "", msg: str = "", is_err: bool = False) -> bytes:
+               sq: str = "", msg: str = "", is_err: bool = False,
+               dsort: str = "", dorder: str = "",
+               ssort: str = "", sorder: str = "") -> bytes:
     """第三方设备接入展示页：接入说明（地址+密钥+curl 示例）+ 设备表 +
     短信表，每 30 秒自动刷新（刷新当前 URL，保留全部查询参数）。
-    设备可编辑手机号/类型/备注；设备表、短信表各自服务端分页
-    （dpage/spage 互不影响）；短信只保留 1 小时、可筛选/复制/删除。
+    接入密钥可在本页自定义设置或随机更换（换后旧密钥立即失效）；
+    设备可编辑手机号/类型/备注，在线设备显示在线时长；设备表、短信表
+    各自服务端分页（dpage/spage 互不影响）；两表表头可点排序（服务端
+    排序 dsort/dorder、ssort/sorder，当前列带 ▲/▼，与分页/筛选共存）；
+    短信只保留 1 小时、可筛选/复制/删除，时间分上传时间（服务器收到）
+    与短信时间（设备上报）两列。
     在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
     （fleet 列表函数已算好 online_now）。"""
     if fleet is None:
@@ -1094,6 +1126,12 @@ def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
                                 "<div class='card'>设备接入模块未加载</div>"
                                 "<p><a class='btn gray' href='/'>返回账号列表</a></p>",
                     msg, is_err)
+    if dsort not in ("phone", "type", "status", "duration", "last_seen"):
+        dsort = "last_seen"
+    dorder = "asc" if dorder == "asc" else "desc"
+    if ssort not in ("received", "device_ts", "device", "sender"):
+        ssort = "received"
+    sorder = "asc" if sorder == "asc" else "desc"
     base = display_base()
     head = f"""<h1>设备接入</h1>
 <div class="card"><h2>接入说明</h2>
@@ -1107,6 +1145,25 @@ IMEI 即设备身份。页面每 30 秒自动刷新。</p>
 <label>接入密钥（明文，仅本管理页可见，别外传）</label>
 <textarea id="fleetkey" rows="2" readonly>{esc(fleet.key_plain())}</textarea>
 <button type="button" onclick="fleetCopy()">复制密钥</button>
+<p class="small">换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报。</p>
+<form method="post" action="/fleet/key/update" class="row"
+ onsubmit="return confirm('换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报，确定继续？')">
+<input type="hidden" name="dpage" value="{dpage}">
+<input type="hidden" name="spage" value="{spage}">
+<input type="hidden" name="sdev" value="{esc(sdev)}">
+<input type="hidden" name="sq" value="{esc(sq)}">
+<label>自定义新密钥 <input name="new_key" style="width:auto"
+ placeholder="至少 8 位，字母数字与常见符号"></label>
+<button type="submit">保存新密钥</button>
+</form>
+<form method="post" action="/fleet/key/rotate" class="inline"
+ onsubmit="return confirm('换密钥后旧密钥立即失效，设备端要同步改成新密钥才能继续上报，确定继续？')">
+<input type="hidden" name="dpage" value="{dpage}">
+<input type="hidden" name="spage" value="{spage}">
+<input type="hidden" name="sdev" value="{esc(sdev)}">
+<input type="hidden" name="sq" value="{esc(sq)}">
+<button type="submit" class="gray">随机换一把</button>
+</form>
 <p class="small">curl 示例（把 &lt;接入密钥&gt; 换成上面的密钥）：</p>
 <pre>curl -X POST {base}/api/v1/heartbeat \\
   -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
@@ -1143,11 +1200,29 @@ async function smsCopy(id) {{
         f"<input type='hidden' name='dpage' value='{dpage}'>"
         f"<input type='hidden' name='spage' value='{spage}'>"
         f"<input type='hidden' name='sdev' value='{esc(sdev)}'>"
-        f"<input type='hidden' name='sq' value='{esc(sq)}'>")
+        f"<input type='hidden' name='sq' value='{esc(sq)}'>"
+        f"<input type='hidden' name='dsort' value='{esc(dsort)}'>"
+        f"<input type='hidden' name='dorder' value='{dorder}'>"
+        f"<input type='hidden' name='ssort' value='{esc(ssort)}'>"
+        f"<input type='hidden' name='sorder' value='{sorder}'>")
+
+    def dev_th(label, key):
+        # 换设备排序：设备页码重置 1，短信的页码/筛选/排序保留
+        return _fleet_th(label, key, dsort, dorder,
+                         lambda k, nxt: "/fleet" + _fleet_qs(
+                             1, spage, sdev, sq, k, nxt, ssort, sorder))
+
+    def sms_th(label, key):
+        # 换短信排序：短信页码重置 1，设备的页码/排序保留
+        return _fleet_th(label, key, ssort, sorder,
+                         lambda k, nxt: "/fleet" + _fleet_qs(
+                             dpage, 1, sdev, sq, dsort, dorder,
+                             k, nxt) + "#sms")
 
     # ---------- 设备表（分页 + 行内编辑） ----------
     try:
-        devices, dtotal = fleet.list_devices_page(dpage, per)
+        devices, dtotal = fleet.list_devices_page(dpage, per,
+                                                  sort=dsort, order=dorder)
     except Exception:  # noqa: BLE001
         devices, dtotal = [], 0
     dpages = max(1, (dtotal + per - 1) // per)
@@ -1171,15 +1246,16 @@ async function smsCopy(id) {{
             f"<td>{esc(d.get('type') or '—')}</td>"
             f"<td>{esc(d.get('remark') or '—')}</td>"
             f"<td>{status}</td>"
+            f"<td>{esc(d.get('online_duration') or '—')}</td>"
             f"<td>{esc(fleet.fmt_ts(d.get('last_seen')))}</td>"
             f"<td>{esc(d.get('model') or '—')}</td><td>{bat_s}</td>"
             f"<td style='white-space:nowrap'>"
             f"<button type='button' onclick='fleetToggleEdit({i})'>编辑</button> "
             f"<a class='btn gray' href='/fleet"
-            f"{_fleet_qs(dpage, 1, d['imei'], '')}#sms'>看短信</a></td></tr>")
+            f"{_fleet_qs(dpage, 1, d['imei'], '', dsort, dorder, ssort, sorder)}#sms'>看短信</a></td></tr>")
         dtrs.append(
             f"<tr id='fleet-edit-{i}' style='display:none'>"
-            f"<td colspan='9'>"
+            f"<td colspan='10'>"
             f"<form method='post' action='/fleet/device/update' class='row'>"
             f"<input type='hidden' name='imei' value='{esc(d['imei'])}'>"
             f"{back_hidden}"
@@ -1195,13 +1271,17 @@ async function smsCopy(id) {{
             f"</form></td></tr>")
     dev_pager = _fleet_pager(
         dpage, dpages, dtotal, "台设备",
-        lambda p: "/fleet" + _fleet_qs(p, spage, sdev, sq))
+        lambda p: "/fleet" + _fleet_qs(p, spage, sdev, sq,
+                                       dsort, dorder, ssort, sorder))
     dev_html = ("<div class='card'><h2>设备</h2><table>"
-                "<tr><th>IMEI</th><th>手机号</th><th>类型</th><th>备注</th>"
-                "<th>状态</th><th>最后心跳</th><th>型号</th><th>电量</th>"
-                "<th>操作</th></tr>" +
+                "<tr><th>IMEI</th>"
+                + dev_th("手机号", "phone") + dev_th("类型", "type")
+                + "<th>备注</th>" + dev_th("状态", "status")
+                + dev_th("在线时长", "duration")
+                + dev_th("最后心跳", "last_seen")
+                + "<th>型号</th><th>电量</th><th>操作</th></tr>" +
                 ("".join(dtrs) if dtrs
-                 else "<tr><td colspan='9' class='small'>暂无设备</td></tr>") +
+                 else "<tr><td colspan='10' class='small'>暂无设备</td></tr>") +
                 "</table>" + dev_pager + "</div>")
 
     # ---------- 短信表（分页 + 筛选 + 复制/删除） ----------
@@ -1222,7 +1302,8 @@ async function smsCopy(id) {{
                         f"{esc(sdev)}</option>")
     try:
         msgs, stotal = fleet.list_sms_page(spage, per, sdev or None,
-                                           sq or None)
+                                           sq or None,
+                                           sort=ssort, order=sorder)
     except Exception:  # noqa: BLE001
         msgs, stotal = [], 0
     spages = max(1, (stotal + per - 1) // per)
@@ -1233,6 +1314,8 @@ async function smsCopy(id) {{
         strs_.append(
             f"<tr><td style='white-space:nowrap'>"
             f"{esc(fleet.fmt_ts(m.get('received_at')))}</td>"
+            f"<td style='white-space:nowrap'>"
+            f"{esc(fleet.fmt_ts(m.get('device_ts')))}</td>"
             f"<td>{esc(dev)}</td><td>{esc(m.get('sender') or '—')}</td>"
             f"<td id='smsc-{m['id']}' "
             f"style='white-space:pre-wrap;word-break:break-word'>"
@@ -1247,15 +1330,21 @@ async function smsCopy(id) {{
             f"</td></tr>")
     sms_pager = _fleet_pager(
         spage, spages, stotal, "条短信",
-        lambda p: "/fleet" + _fleet_qs(dpage, p, sdev, sq) + "#sms")
+        lambda p: "/fleet" + _fleet_qs(dpage, p, sdev, sq,
+                                       dsort, dorder, ssort, sorder) + "#sms")
     clear_link = (f" <a class='btn gray' href='/fleet"
-                  f"{_fleet_qs(dpage, 1, '', '')}#sms'>清除筛选</a>"
+                  f"{_fleet_qs(dpage, 1, '', '', dsort, dorder, ssort, sorder)}#sms'>清除筛选</a>"
                   if (sdev or sq) else "")
     sms_html = (
         "<div class='card' id='sms'><h2>短信</h2>"
-        "<p class='small'>短信保留 1 小时，过期自动删除。</p>"
+        "<p class='small'>短信保留 1 小时，过期自动删除。上传时间 = 服务器"
+        "收到短信的时间，短信时间 = 设备上报的短信时间。</p>"
         "<form method='get' action='/fleet' class='row'>"
         f"<input type='hidden' name='dpage' value='{dpage}'>"
+        f"<input type='hidden' name='dsort' value='{esc(dsort)}'>"
+        f"<input type='hidden' name='dorder' value='{dorder}'>"
+        f"<input type='hidden' name='ssort' value='{esc(ssort)}'>"
+        f"<input type='hidden' name='sorder' value='{sorder}'>"
         f"<label>设备 <select name='sdev' style='width:auto'>"
         f"{''.join(dev_opts)}</select></label>"
         f"<label>关键词 <input name='sq' style='width:auto' "
@@ -1265,10 +1354,12 @@ async function smsCopy(id) {{
         "onsubmit=\"return confirm('确定清空全部短信？')\">"
         f"{back_hidden}"
         "<button type='submit' class='red'>清空全部短信</button></form>"
-        "<table><tr><th>时间</th><th>设备</th><th>发送方</th>"
-        "<th>内容</th><th>操作</th></tr>" +
+        "<table><tr>"
+        + sms_th("上传时间", "received") + sms_th("短信时间", "device_ts")
+        + sms_th("设备", "device") + sms_th("发送方", "sender")
+        + "<th>内容</th><th>操作</th></tr>" +
         ("".join(strs_) if strs_
-         else "<tr><td colspan='5' class='small'>暂无短信</td></tr>") +
+         else "<tr><td colspan='6' class='small'>暂无短信</td></tr>") +
         "</table>" + sms_pager + "</div>")
     body = (head + dev_html + sms_html +
             "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
@@ -2209,7 +2300,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/fleet":
             return self._send(200, fleet_page(
                 _page_no(q.get("dpage")), _page_no(q.get("spage")),
-                q.get("sdev", ""), q.get("sq", ""), msg, is_err))
+                q.get("sdev", ""), q.get("sq", ""), msg, is_err,
+                q.get("dsort", ""), q.get("dorder", ""),
+                q.get("ssort", ""), q.get("sorder", "")))
         if u.path == "/oos/get":
             key = q.get("key", "")
             if not key:
@@ -2347,22 +2440,54 @@ class Handler(BaseHTTPRequestHandler):
                 form.get("type", ""), form.get("remark", ""))
             back = "/fleet" + _fleet_qs(
                 _page_no(form.get("dpage")), _page_no(form.get("spage")),
-                form.get("sdev", ""), form.get("sq", ""))
+                form.get("sdev", ""), form.get("sq", ""),
+                form.get("dsort", ""), form.get("dorder", ""),
+                form.get("ssort", ""), form.get("sorder", ""))
             return self._redirect(back, "设备已更新" if ok else "设备不存在",
                                   not ok)
         if u.path == "/fleet/sms/delete":
             ok = bool(fleet) and fleet.delete_sms(form.get("id", ""))
             back = "/fleet" + _fleet_qs(
                 _page_no(form.get("dpage")), _page_no(form.get("spage")),
-                form.get("sdev", ""), form.get("sq", ""))
+                form.get("sdev", ""), form.get("sq", ""),
+                form.get("dsort", ""), form.get("dorder", ""),
+                form.get("ssort", ""), form.get("sorder", ""))
             return self._redirect(back, "短信已删除" if ok else "短信不存在",
                                   not ok)
         if u.path == "/fleet/sms/clear":
             n = fleet.clear_sms() if fleet else 0
             back = "/fleet" + _fleet_qs(
                 _page_no(form.get("dpage")), 1,
-                form.get("sdev", ""), form.get("sq", ""))
+                form.get("sdev", ""), form.get("sq", ""),
+                form.get("dsort", ""), form.get("dorder", ""),
+                form.get("ssort", ""), form.get("sorder", ""))
             return self._redirect(back, f"已清空 {n} 条短信")
+        if u.path == "/fleet/key/update":
+            if fleet:
+                ok, err = fleet.set_custom_key(form.get("new_key", ""))
+            else:
+                ok, err = False, "设备接入模块未加载"
+            back = "/fleet" + _fleet_qs(
+                _page_no(form.get("dpage")), _page_no(form.get("spage")),
+                form.get("sdev", ""), form.get("sq", ""),
+                form.get("dsort", ""), form.get("dorder", ""),
+                form.get("ssort", ""), form.get("sorder", ""))
+            return self._redirect(
+                back,
+                "接入密钥已更新，旧密钥已失效" if ok
+                else f"新密钥不合格：{err}", not ok)
+        if u.path == "/fleet/key/rotate":
+            if fleet:
+                fleet.rotate_key()
+            back = "/fleet" + _fleet_qs(
+                _page_no(form.get("dpage")), _page_no(form.get("spage")),
+                form.get("sdev", ""), form.get("sq", ""),
+                form.get("dsort", ""), form.get("dorder", ""),
+                form.get("ssort", ""), form.get("sorder", ""))
+            return self._redirect(
+                back,
+                "已随机更换接入密钥，旧密钥已失效" if fleet
+                else "设备接入模块未加载", not fleet)
         if u.path == "/oos/delete":
             cli = u3_client()
             key = form.get("key", "")
