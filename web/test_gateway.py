@@ -468,5 +468,136 @@ check("未知模型名原样透传", seen_models == ["nope-9"], str(seen_models)
 
 gateway._open_chat = orig_open
 
+# ---------- 13. 到期严格优先选号 ----------
+print("[13] 到期优先选号")
+import time as _time  # noqa: E402
+
+import cb_log  # noqa: E402
+
+D_MS = 86400 * 1000
+E1 = 1795800000000          # 最早到期
+E2 = E1 + 10 * D_MS
+E3 = E1 + 30 * D_MS         # 最晚到期
+
+
+def _pkg(left, expire_ms):
+    return {"code": "gift", "name": "包", "total": left, "used": 0,
+            "left": left, "expire_ms": expire_ms, "refresh_ms": 0,
+            "status": "valid"}
+
+
+def make_rec_pkgs(uid, label, access, refresh, left, pkgs,
+                  stamp="2026-11-27 09:05:00"):
+    rec = make_rec(uid, label, access, refresh, left=left)
+    rec["quota"] = {"usage_left": left, "updated_at": stamp,
+                    "packages": pkgs}
+    return rec
+
+
+gateway._sessions.clear()
+gateway._drained.clear()
+
+# _earliest_expiry 口径：跳过已用完的包，取仍有剩余的最小 expire_ms
+r_tmp = make_rec_pkgs("uT", "临时", "tok-T", "ref-T", 8,
+                      [_pkg(0, E1), _pkg(5, E3), _pkg(3, E2)])
+check("最早到期跳过空包", gateway._earliest_expiry(r_tmp) == E2,
+      str(gateway._earliest_expiry(r_tmp)))
+check("无包数据 → None",
+      gateway._earliest_expiry(make_rec("uT2", "临时2", "t", "r")) is None)
+r_tmp2 = make_rec_pkgs("uT3", "临时3", "tok-T3", "ref-T3", 5, [_pkg(5, 0)])
+check("包无到期时刻 → None", gateway._earliest_expiry(r_tmp2) is None)
+
+hits = []
+gateway._open_chat = lambda a, u, e, p, c: (
+    hits.append(a.get("accessToken")),
+    (200, FakeResp(sse(["x"])), b""))[1]
+store = FakeStore([
+    make_rec_pkgs("uEA", "A晚到期", "tok-EA", "ref-EA", 50, [_pkg(50, E3)]),
+    make_rec_pkgs("uEB", "B早到期", "tok-EB", "ref-EB", 50, [_pkg(50, E1)]),
+    make_rec("uEC", "C无包数据", "tok-EC", "ref-EC", left=999),
+])
+out = gateway.chat(store, {"model": "glm-5.3-flash", "stream": True,
+                           "messages": [{"role": "user",
+                                         "content": "到期一"}]}, None)
+b"".join(out.payload)
+check("到期最早者优先（压过高额度无数据号）", hits == ["tok-EB"], str(hits))
+exp_day = _time.strftime("%Y-%m-%d", _time.localtime(E1 / 1000))
+check("选号日志记到期依据",
+      any(f"到期优先 {exp_day}" in line and "B早到期" in line
+          for line in cb_log._buf),
+      str([l for l in cb_log._buf if "选号" in l][-2:]))
+
+# 换号沿到期顺序往下走；额度不足给队首打内存标记
+hits.clear()
+
+
+def open_quota_b(auth, uid, ent, payload, conv_id):
+    hits.append(auth.get("accessToken"))
+    if auth.get("accessToken") == "tok-EB":
+        return 402, None, b'{"code": 14001, "msg": "insufficient quota"}'
+    return 200, FakeResp(sse(["y"])), b""
+
+
+gateway._open_chat = open_quota_b
+out = gateway.chat(store, {"model": "glm-5.3-flash", "stream": True,
+                           "messages": [{"role": "user",
+                                         "content": "到期二"}]}, None)
+b"".join(out.payload)
+check("换号沿到期顺序 B→A", hits == ["tok-EB", "tok-EA"], str(hits))
+check("额度不足已打内存标记",
+      gateway._is_drained(store.get("uEB")))
+
+# 新会话跳过被标记的队首（哪怕它到期最早）
+hits.clear()
+gateway._open_chat = lambda a, u, e, p, c: (
+    hits.append(a.get("accessToken")),
+    (200, FakeResp(sse(["z"])), b""))[1]
+out = gateway.chat(store, {"model": "glm-5.3-flash", "stream": True,
+                           "messages": [{"role": "user",
+                                         "content": "到期三"}]}, None)
+b"".join(out.payload)
+check("新会话跳过已标记的号", hits == ["tok-EA"], str(hits))
+
+# 标记随额度快照刷新（updated_at 变化）自动失效
+rec_b = store.get("uEB")
+rec_b["quota"]["updated_at"] = "2026-11-27 10:05:00"
+check("额度刷新后标记失效", not gateway._is_drained(rec_b))
+rec_b["quota"]["updated_at"] = "2026-11-27 09:05:00"
+gateway._mark_drained(rec_b)
+check("标记可重新打上", gateway._is_drained(rec_b))
+
+# 粘性优先于排序与标记：已绑定的会话继续用原号
+store2 = FakeStore([
+    make_rec_pkgs("uSA", "SA晚到期", "tok-SA", "ref-SA", 50, [_pkg(50, E3)]),
+    make_rec_pkgs("uSB", "SB早到期", "tok-SB", "ref-SB", 50, [_pkg(50, E1)]),
+])
+hits.clear()
+out = gateway.chat(store2, dict(BODY, stream=True), "sess-exp1")
+b"".join(out.payload)
+gateway._mark_drained(store2.get("uSB"))
+out = gateway.chat(store2, dict(BODY, stream=True), "sess-exp1")
+b"".join(out.payload)
+check("粘性会话不被标记/排序换走",
+      hits == ["tok-SB", "tok-SB"], str(hits))
+hits.clear()
+out = gateway.chat(store2, dict(BODY, stream=True), "sess-exp2")
+b"".join(out.payload)
+check("新会话才落到未标记的队首", hits == ["tok-SA"], str(hits))
+gateway._drained.clear()
+
+# 无到期数据组维持加权随机（此处打桩验证回落路径）
+store3 = FakeStore([make_rec("uN1", "N1", "tok-N1", "ref-N1", left=10),
+                    make_rec("uN2", "N2", "tok-N2", "ref-N2", left=20)])
+gateway._weighted_pick = lambda cands: cands[-1]
+hits.clear()
+out = gateway.chat(store3, {"model": "glm-5.3-flash", "stream": True,
+                            "messages": [{"role": "user",
+                                          "content": "无到期"}]}, None)
+b"".join(out.payload)
+check("无到期数据回落加权选号", hits == ["tok-N2"], str(hits))
+gateway._weighted_pick = orig_pick
+gateway._open_chat = orig_open
+gateway._sessions.clear()
+
 print(f"\n结果：PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

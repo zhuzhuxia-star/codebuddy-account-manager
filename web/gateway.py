@@ -26,6 +26,11 @@ official-client.md）所记录的官方客户端行为，本模块为 Python 独
   - 错误按业务码分类：402/14001 系列=额度不足，12153=会话失效，
     11101/11115/11128=请求本身的问题（不换号），429/14003/6xxx=繁忙换号，
     6021=上游繁忙直接回 503 不换号，11140+request illegal=账号风控禁用。
+  - 选号规则（用户定）：池内按资源包最早到期严格优先——到期时刻取
+    额度快照 packages[].expire_ms（fetch_quota 已按包型算好，与仪表盘
+    卡片同源同口径）；无到期数据的号沉底、组内按剩余额度加权随机；
+    回额度不足的号打进程内标记，新会话跳过它，直到该号额度快照被
+    刷新（updated_at 变化）或进程重启；会话粘性优先于排序。
 
 令牌纪律：只有账号记录 in_pool=True 且健康的号才接请求；401 先走现有
 续期逻辑（cb_api.refresh_auth）刷一次再重试同号，续期按账号加锁单飞，
@@ -212,6 +217,74 @@ def _weighted_pick(cands: list[dict]) -> dict:
     if sum(weights) <= 0:
         weights = [1.0] * len(cands)
     return random.choices(cands, weights=weights, k=1)[0]
+
+
+# ---------- 到期优先选号 ----------
+def _earliest_expiry(rec: dict):
+    """账号的最早到期时刻（ms）：额度快照 packages 里仍有剩余
+    （left > 0）的包中最小的 expire_ms（fetch_quota 已按官方包型
+    口径算好，与仪表盘卡片展示的是同一份存储值）。无包数据、包
+    无到期时刻或有剩余的包都没有到期时刻 → None（沉底组）。"""
+    q = rec.get("quota") or {}
+    if not isinstance(q, dict):
+        return None
+    best = None
+    for p in q.get("packages") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            left = float(p.get("left") or 0)
+            ems = float(p.get("expire_ms") or 0)
+        except (TypeError, ValueError):
+            continue
+        if left > 0 and ems > 0 and (best is None or ems < best):
+            best = ems
+    return best
+
+
+# 额度不足内存标记：account_id -> 标记时该号额度快照的 updated_at。
+# 只活在进程内（重启即清）；快照被刷新（updated_at 变化）后标记
+# 自动失效。新会话选号时跳过被标记的号，粘性会话不受影响。
+_drained: dict[str, str] = {}
+_drained_lock = threading.Lock()
+
+
+def _quota_stamp(rec: dict) -> str:
+    q = rec.get("quota") or {}
+    return str(q.get("updated_at") or "") if isinstance(q, dict) else ""
+
+
+def _mark_drained(rec: dict) -> None:
+    with _drained_lock:
+        _drained[rec.get("id") or ""] = _quota_stamp(rec)
+
+
+def _is_drained(rec: dict) -> bool:
+    with _drained_lock:
+        stamp = _drained.get(rec.get("id") or "")
+    return stamp is not None and stamp == _quota_stamp(rec)
+
+
+def _ordered_pick(cands: list[dict]):
+    """到期严格优先选号，返回 (pick, expire_ms|None)。
+
+    - 先剔除额度不足标记未失效的号（全被标记时回落全量，避免把
+      池子误杀成 503，最终仍以真实上游结果为准）；
+    - 有到期数据的取最早到期者，同刻并列按剩余额度加权随机；
+    - 都无到期数据时维持按剩余额度加权随机，expire_ms 为 None。"""
+    live = [c for c in cands if not _is_drained(c["rec"])]
+    pool = live or cands
+    dated = []
+    for c in pool:
+        ems = _earliest_expiry(c["rec"])
+        if ems is not None:
+            dated.append((ems, c))
+    if dated:
+        first = min(e for e, _ in dated)
+        head = [c for e, c in dated if e == first]
+        pick = _weighted_pick(head) if len(head) > 1 else head[0]
+        return pick, first
+    return _weighted_pick(pool), None
 
 
 # ---------- 会话粘性 ----------
@@ -1208,9 +1281,16 @@ def chat(store, body: dict, session_header: str | None) -> Outcome:
                 if c["rec"].get("id") == sent["account_id"]:
                     pick = c
                     break
+        pick_exp = None
         if pick is None:
-            pick = _weighted_pick(cands)
+            pick, pick_exp = _ordered_pick(cands)
         rec, auth = pick["rec"], pick["auth"]
+        if pick_exp is not None:
+            exp_day = time.strftime("%Y-%m-%d",
+                                    time.localtime(pick_exp / 1000))
+            tail = cb_app._phone_tail(rec) or (rec.get("label") or "?")
+            cb_log.log(f"选号 | 到期优先 {exp_day} | 账号 "
+                       f"{rec.get('label') or '?'}（尾号 {tail}）", "gateway")
         tried.add(rec.get("id") or "")
         uid, ent, dept = _account_meta(rec)
         conv_id = (sent or {}).get("conv_id") or _uuid7()
@@ -1250,6 +1330,8 @@ def chat(store, body: dict, session_header: str | None) -> Outcome:
                                       time.time() - t0)
                             return _err_outcome(400, str(code),
                                                 msg or "上游拒绝该请求")
+                        if cls == "quota":
+                            _mark_drained(rec)
                         last_note = f"上游业务错误 {code} {msg}"
                         _log_call(rec, model, want_stream, f"FAIL {last_note}",
                                   "-", time.time() - t0)
@@ -1329,6 +1411,10 @@ def chat(store, body: dict, session_header: str | None) -> Outcome:
                 return _err_outcome(503, "upstream_busy",
                                     msg or "上游繁忙，请稍后重试",
                                     "server_error")
+            if cls == "quota":
+                # 额度不足：换号之外再打内存标记，新会话直接跳过
+                # 这个号，直到它的额度快照被刷新或进程重启。
+                _mark_drained(rec)
             last_note = f"上游 {status} {code or ''} {msg}".strip()
             _log_call(rec, model, want_stream, f"FAIL {last_note}", "-",
                       time.time() - t0)
