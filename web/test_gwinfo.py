@@ -106,15 +106,17 @@ check("视频模型上下文未给", k.get("context") is None, str(k.get("contex
 h = by_id.get("hunyuan-image-alpha") or {}
 check("图像模型照样列出且无积分字段", bool(h) and h.get("credits") is None)
 
-# ---------- 2. /v1/models 裁剪口径未被改动 ----------
-print("[2] list_models 同源且裁剪口径不变")
+# ---------- 2. /v1/models 与官方目录同口径（数值化、不滤除） ----------
+print("[2] list_models 同源且与目录同口径")
 reset_cache()
 data = gateway.list_models(store)
 tm = {m["id"]: m for m in data["data"]}
-check("裁剪版 glm-5.3-flash context_length 仍是目录原 dict",
-      (tm.get("glm-5.3-flash") or {}).get("context_length") ==
-      {"defaultLength": 300000, "supportedLengths": [300000, 600000, 1000000]},
+check("裁剪版 glm-5.3-flash context_length 为数值 defaultLength",
+      (tm.get("glm-5.3-flash") or {}).get("context_length") == 300000,
       str((tm.get("glm-5.3-flash") or {}).get("context_length")))
+check("裁剪版条数 == 样本目录总数（不滤除）",
+      len(data["data"]) == len(SAMPLE),
+      f"{len(data['data'])} vs {len(SAMPLE)}")
 check("裁剪版带 credits 原值",
       (tm.get("glm-5.3-flash") or {}).get("credits") == "x0.08")
 

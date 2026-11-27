@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """gateway.py 夹具测试：mock 上游，覆盖鉴权/模型/流式/聚合/入池过滤/
 401 续期重试/换号兜底/会话粘性/服务端点。运行：python3 test_gateway.py"""
+import copy
 import http.client
 import io
 import json
@@ -123,6 +124,55 @@ rec = make_rec("u-live", "活号", "tok-live", "ref-live")
 data = gateway.list_models(FakeStore([rec]))
 check("有账号时用上游目录", [m["id"] for m in data["data"]] == ["live-model-1"])
 gateway._fetch_catalog = orig_fetch
+gateway._models_cache.update(at=0, data=None)
+
+# 真实官方目录样本走全链路（_fetch_catalog_raw 打桩 → 真 _trim_catalog）：
+# /v1/models 与官方目录同口径——不滤除、context_length 数值化
+print("[2b] 模型列表与官方目录同口径")
+SAMPLE = json.loads(open(os.path.join(os.path.dirname(
+    os.path.abspath(__file__)), "catalog_sample.json"),
+    encoding="utf-8").read())
+orig_raw = gateway._fetch_catalog_raw
+gateway._fetch_catalog_raw = lambda auth, uid: copy.deepcopy(SAMPLE)
+gateway._models_cache.clear()
+gateway._models_cache.update(at=0, data=None)
+cat_store = FakeStore([make_rec("u-cat", "目录号", "tok-cat", "ref-cat")])
+data = gateway.list_models(cat_store)
+entries = data["data"]
+by_id = {m["id"]: m for m in entries}
+check("返回条数 == 样本目录总数（不滤除）", len(entries) == len(SAMPLE),
+      f"{len(entries)} vs {len(SAMPLE)}")
+disp_rows = gateway.catalog_display(cat_store)
+check("返回条数 == 设置页参考表行数",
+      disp_rows is not None and len(entries) == len(disp_rows),
+      f"{len(entries)} vs {len(disp_rows) if disp_rows else None}")
+g53f = by_id.get("glm-5.3-flash") or {}
+check("context_length 是数值而非字典",
+      isinstance(g53f.get("context_length"), int),
+      str(type(g53f.get("context_length"))))
+check("有 contextWindow 取 defaultLength",
+      g53f.get("context_length") == 300000, str(g53f.get("context_length")))
+check("无 contextWindow 取 maxInputTokens",
+      (by_id.get("auto") or {}).get("context_length") == 256000,
+      str((by_id.get("auto") or {}).get("context_length")))
+check("补全类模型不再被过滤",
+      "codewise-completions" in by_id)
+check("无上下文数据的模型不给 context_length（不编造）",
+      "context_length" not in (by_id.get("codewise-completions") or {}))
+check("max_output_tokens 原值透传",
+      g53f.get("max_output_tokens") == 131072,
+      str(g53f.get("max_output_tokens")))
+check("credits 积分倍率原值透传", g53f.get("credits") == "x0.08",
+      str(g53f.get("credits")))
+check("思考档位原值透传",
+      g53f.get("reasoning_supported") == ["low", "high", "max"]
+      and g53f.get("reasoning_default") == "high"
+      and g53f.get("reasoning_can_disable") is False,
+      str({k: g53f.get(k) for k in ("reasoning_supported",
+                                     "reasoning_default",
+                                     "reasoning_can_disable")}))
+gateway._fetch_catalog_raw = orig_raw
+gateway._models_cache.clear()
 gateway._models_cache.update(at=0, data=None)
 
 # ---------- 3. 请求体转换 ----------

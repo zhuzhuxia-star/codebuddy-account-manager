@@ -1000,24 +1000,31 @@ def _fetch_catalog_raw(auth: dict, uid: str) -> list[dict] | None:
 
 
 def _trim_catalog(models: list[dict]) -> list[dict] | None:
-    """把官方目录原文裁成 /v1/models 的 OpenAI 形状（口径与最初版本一致）。"""
+    """把官方目录原文裁成 /v1/models 的 OpenAI 形状，与官方目录同口径：
+    不滤除任何模型（目录有多少返回多少，与设置页参考表同数）；数值一律
+    取目录原值——context_length 为数值（有 contextWindow 取 defaultLength，
+    否则取 maxInputTokens，两者都没有就不给这个字段，不编造），
+    max_output_tokens、credits（积分倍率）与思考档位（目录 reasoning
+    原值）目录有就透传。object/created/owned_by 是 OpenAI 形状的接口
+    契约，不是官方数据，保持不变。"""
     out = []
     for m in models:
         if not m.get("id"):
             continue
-        # 补全类模型（只有 supportsExtra、没有输入上限）不是对话模型，跳过
-        if m.get("supportsExtra") and not (m.get("maxInputTokens")
-                                           or m.get("contextWindow")):
-            continue
         entry = {"id": str(m["id"]), "object": "model", "created": 0,
                  "owned_by": "workbuddy"}
-        ctx = m.get("contextWindow") or m.get("maxInputTokens")
+        ctx = _context_num(m)
         if ctx:
             entry["context_length"] = ctx
         if m.get("maxOutputTokens"):
             entry["max_output_tokens"] = m["maxOutputTokens"]
         if m.get("credits") is not None:
             entry["credits"] = m["credits"]
+        reasoning = _reasoning_fields(m)
+        for key in ("reasoning_supported", "reasoning_default",
+                    "reasoning_can_disable"):
+            if reasoning[key] is not None:
+                entry[key] = reasoning[key]
         out.append(entry)
     return out or None
 
