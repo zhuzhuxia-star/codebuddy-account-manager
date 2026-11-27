@@ -1315,7 +1315,8 @@ def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
     常驻一对 ▲▼ 小箭头点排序（列名本身不可点；服务端排序
     dsort/dorder、ssort/sorder，当前方向箭头高亮，与分页/筛选共存）；
     短信只保留 1 小时、可筛选/复制/删除，时间分上传时间（服务器收到）
-    与短信时间（设备上报）两列。
+    与短信时间（设备上报）两列。页底「最近请求」展示两个接口最近
+    50 条脱敏请求日志（fleet_access.log，200 绿色、其余红色）。
     在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
     （fleet 列表函数已算好 online_now）。"""
     if fleet is None:
@@ -1428,6 +1429,24 @@ setInterval(fleetTick, 30000);
 
     dev_inner, sms_inner = _fleet_tables(
         dpage, spage, sdev, sq, dsort, dorder, ssort, sorder)
+    log_rows = []
+    for e in reversed(fleet.read_access_log(50)):
+        color = "#15803d" if e["status"] == 200 else "#b91c1c"
+        tail = ("…" + esc(e["imei_tail"])) if e["imei_tail"] != "-" else "-"
+        log_rows.append(
+            f"<tr><td>{esc(e['time'])}</td><td>{esc(e['endpoint'])}</td>"
+            f"<td><span style='color:{color};font-weight:bold'>"
+            f"{e['status']}</span></td>"
+            f"<td>{tail}</td><td>{'是' if e['key'] else '否'}</td>"
+            f"<td class='small'>{esc(e['fields'])}</td></tr>")
+    log_inner = (
+        "<p class='small'>两个接口最近 50 条请求（最新在前）。日志只记"
+        "脱敏信息：不记密钥值、短信内容与完整号码。</p>"
+        "<table><tr><th>时间</th><th>接口</th><th>状态</th>"
+        "<th>IMEI 尾号</th><th>带密钥</th><th>请求字段</th></tr>"
+        + ("".join(log_rows) if log_rows
+           else "<tr><td colspan='6' class='small'>暂无请求记录</td></tr>")
+        + "</table>")
     body = (head
             + "<div class='card'><h2>设备 "
               "<span class='small' id='fleet-upd-dev'></span></h2>"
@@ -1435,6 +1454,8 @@ setInterval(fleetTick, 30000);
             + "<div class='card' id='sms'><h2>短信 "
               "<span class='small' id='fleet-upd-sms'></span></h2>"
               "<div id='fleet-sms-body'>" + sms_inner + "</div></div>"
+            + "<div class='card'><h2>最近请求</h2>"
+            + log_inner + "</div>"
             + "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
     return page("设备接入", body, msg, is_err)
 
@@ -2188,17 +2209,31 @@ class Handler(BaseHTTPRequestHandler):
         if fleet is None:
             return self._send_json(503, {"ok": False,
                                          "error": "设备接入模块未加载"})
-        if not fleet.check_key(self.headers.get("X-Device-Key") or "",
-                               self.headers.get("Authorization") or ""):
-            return self._send_json(401, {"ok": False, "error": "接入密钥无效"},
-                                   {"WWW-Authenticate": "Bearer"})
+        path = "/api/v1/" + kind
+        # 日志元数据：是否带了密钥头（只记有无，不记值）。
+        key_present = bool((self.headers.get("X-Device-Key") or "").strip())
+        if not key_present:
+            auth = (self.headers.get("Authorization") or "").strip()
+            key_present = auth.startswith("Bearer ") and bool(
+                auth[len("Bearer "):].strip())
+        ct = self.headers.get("Content-Type") or ""
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n > 0 else b""
+        # 宽松解析：只为日志取字段名与 IMEI 尾号；解析不出按 None 记。
+        body = None
         try:
-            body = json.loads(raw.decode("utf-8"))
-            if not isinstance(body, dict):
-                raise ValueError("not an object")
+            parsed = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed, dict):
+                body = parsed
         except Exception:
+            body = None
+        if not fleet.check_key(self.headers.get("X-Device-Key") or "",
+                               self.headers.get("Authorization") or ""):
+            fleet.log_access(path, 401, body, key_present, ct)
+            return self._send_json(401, {"ok": False, "error": "接入密钥无效"},
+                                   {"WWW-Authenticate": "Bearer"})
+        if body is None:
+            fleet.log_access(path, 400, None, key_present, ct)
             return self._send_json(400, {"ok": False,
                                          "error": "请求体不是合法 JSON"})
         try:
@@ -2207,7 +2242,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 code, obj = fleet.record_sms(body)
         except Exception as e:  # noqa: BLE001
+            fleet.log_access(path, 500, body, key_present, ct)
             return self._send_json(500, {"ok": False, "error": f"内部错误：{e}"})
+        fleet.log_access(path, code, body, key_present, ct)
         return self._send_json(code, obj)
 
     def _cookie_token(self) -> str | None:

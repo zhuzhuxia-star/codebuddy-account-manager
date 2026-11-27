@@ -789,6 +789,73 @@ if _js:
           _r.returncode == 0 and "JSOK 9" in _r.stdout,
           (_r.stdout + _r.stderr)[:200])
 
+# ---------- 接入请求日志（脱敏） ----------
+LOG_IMEI = "860000000000777"
+LOG_H = {"X-Device-Key": fleet.key_plain()}  # 中途已换过密钥，用当前值
+st, _, _ = req("POST", "/api/v1/heartbeat",
+               {"imei": LOG_IMEI, "online": True}, LOG_H)
+check("日志用例心跳 200", st == 200)
+st, _, _ = req("POST", "/api/v1/heartbeat", {"imei": LOG_IMEI})
+check("日志用例无密钥 401", st == 401)
+st, _, _ = req("POST", "/api/v1/sms",
+               {"imei": LOG_IMEI, "from": "10086",
+                "content": "日志脱敏校验短信内容XYZ"}, LOG_H)
+check("日志用例短信 200", st == 200)
+
+entries = fleet.read_access_log(50)
+check("日志已落行", len(entries) >= 3, str(len(entries)))
+last3 = entries[-3:]
+check("日志 200 行口径",
+      last3[0]["status"] == 200 and last3[0]["key"] is True
+      and last3[0]["imei_tail"] == "0777"
+      and last3[0]["endpoint"] == "/api/v1/heartbeat"
+      and "imei" in last3[0]["fields"],
+      str(last3[0] if last3 else None))
+check("日志 401 行口径",
+      last3[1]["status"] == 401 and last3[1]["key"] is False
+      and last3[1]["imei_tail"] == "0777",
+      str(last3[1] if len(last3) > 1 else None))
+check("日志短信行口径",
+      last3[2]["status"] == 200
+      and last3[2]["endpoint"] == "/api/v1/sms"
+      and "content" in last3[2]["fields"],
+      str(last3[2] if len(last3) > 2 else None))
+
+st, _, _ = req("POST", "/api/v1/sms", headers={
+    **LOG_H, "Content-Type": "application/json"}, raw=b"{not json")
+check("坏 JSON 400", st == 400)
+e400 = fleet.read_access_log(50)[-1]
+check("日志 400 行口径",
+      e400["status"] == 400 and e400["key"] is True
+      and e400["imei_tail"] == "-" and e400["fields"] == "-",
+      str(e400))
+
+logtxt = fleet.LOG_FILE.read_text(encoding="utf-8")
+check("日志不含密钥明文", FAKE_KEY not in logtxt
+      and fleet.key_plain() not in logtxt)
+check("日志不含完整 IMEI", LOG_IMEI not in logtxt and IMEI not in logtxt)
+check("日志不含短信内容",
+      "日志脱敏校验短信内容XYZ" not in logtxt
+      and "您的验证码是 123456" not in logtxt)
+check("日志不含完整手机号", "13800000000" not in logtxt)
+check("日志文件 0600",
+      (fleet.LOG_FILE.stat().st_mode & 0o777) == 0o600,
+      oct(fleet.LOG_FILE.stat().st_mode & 0o777))
+
+_orig_log = fleet.LOG_FILE
+fleet.LOG_FILE = DATA_DIR  # 指到目录：open 必失败，验证写日志失败不影响接口
+try:
+    st, _, _ = req("POST", "/api/v1/heartbeat",
+                   {"imei": LOG_IMEI, "online": True}, LOG_H)
+finally:
+    fleet.LOG_FILE = _orig_log
+check("日志写失败不影响接口", st == 200, str(st))
+
+st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
+check("/fleet 含最近请求小节", "最近请求" in htmltxt)
+check("/fleet 日志行渲染尾号", "…0777" in htmltxt)
+check("/fleet 日志状态着色", "#15803d" in htmltxt and "#b91c1c" in htmltxt)
+
 srv.shutdown()
 print(f"\n== fleet: {PASS} passed, {FAIL} failed ==")
 sys.exit(1 if FAIL else 0)

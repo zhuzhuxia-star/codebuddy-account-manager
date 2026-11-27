@@ -15,6 +15,10 @@
     打点、持续在线不刷新、上报离线时清空，页面据此显示「在线时长」。
   - 短信时间分两列：上传时间 = received_at（服务器收到时间）、
     短信时间 = device_ts（设备上报的短信时间，没报 ts 时与上传相同）。
+  - 两个接口的每次请求在 fleet_access.log 追加一行脱敏日志（北京
+    时间/接口/状态码/IMEI 后 4 位/是否带密钥头/Content-Type/请求体
+    字段名列表），绝不记密钥值、短信内容、完整手机号与完整 IMEI；
+    写日志失败静默，永不影响接口本身。管理页底部「最近请求」展示。
 
 在线判定：last_seen 在 ONLINE_WINDOW 秒内且最近一次上报 online=true。
 """
@@ -28,12 +32,13 @@ import secrets
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("APPDATA", "")) / "CodeBuddyAccountManager"
 KEY_FILE = DATA_DIR / "fleet.json"
 DB_FILE = DATA_DIR / "fleet.db"
+LOG_FILE = DATA_DIR / "fleet_access.log"
 
 ONLINE_WINDOW = 180  # 秒：最后心跳在此窗口内且上报在线才算在线
 SMS_TTL = 3600  # 秒：短信只保留 1 小时，过期自动清理
@@ -532,3 +537,67 @@ def clear_sms() -> int:
             return cur.rowcount
         finally:
             conn.close()
+
+
+# ---------- 接入请求日志（脱敏） ----------
+_log_lock = threading.Lock()
+_BJ_TZ = timezone(timedelta(hours=8))  # 日志时间一律北京时间
+
+
+def log_access(endpoint: str, status: int, body, key_present: bool,
+               content_type: str) -> None:
+    """给 heartbeat / sms 的每次请求在 fleet_access.log 追加一行：
+    北京时间（到秒）\\t 接口 \\t 状态码 \\t IMEI 后 4 位（无记 -）\\t
+    key:yes/no \\t Content-Type \\t 请求体字段名列表（逗号分隔，只记
+    字段名不记值）。绝不记密钥值、短信内容、完整手机号/完整 IMEI。
+    写日志全程 try 包住：失败静默，永不影响接口返回。"""
+    try:
+        tail, fields = "-", "-"
+        if isinstance(body, dict):
+            imei = _clean_imei(body)
+            if imei:
+                tail = imei[-4:]
+            names = sorted(str(k) for k in body.keys())
+            if names:
+                fields = ",".join(names)
+        ct = (content_type or "").split(";")[0].strip() or "-"
+        ts = datetime.now(_BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        line = "\t".join([ts, endpoint, str(int(status)), tail,
+                          "key:yes" if key_present else "key:no",
+                          ct, fields])
+        with _log_lock:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            created = not LOG_FILE.exists()
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            if created:
+                try:
+                    os.chmod(LOG_FILE, 0o600)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def read_access_log(limit: int = 50) -> list[dict]:
+    """读 fleet_access.log 最后 limit 行，解析为 dict 列表（文件顺序：
+    旧 → 新，页面展示时再倒序）。坏行跳过；文件不存在返回空列表。"""
+    try:
+        lines = LOG_FILE.read_text(encoding="utf-8",
+                                   errors="replace").splitlines()
+    except Exception:
+        return []
+    out = []
+    for ln in lines[-max(1, int(limit)):]:
+        parts = ln.split("\t")
+        if len(parts) != 7:
+            continue
+        ts, ep, st, tail, keyf, ct, fields = parts
+        try:
+            status = int(st)
+        except (TypeError, ValueError):
+            continue
+        out.append({"time": ts, "endpoint": ep, "status": status,
+                    "imei_tail": tail, "key": keyf == "key:yes",
+                    "content_type": ct, "fields": fields})
+    return out
