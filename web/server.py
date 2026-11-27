@@ -19,6 +19,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -439,6 +440,35 @@ def esc(s) -> str:
     return html.escape(str(s if s is not None else ""), quote=True)
 
 
+# ---- 页面展示基地址：以浏览器地址栏（当前请求 Host）为准 ----
+# 用户规矩（2026-11-27 新定，取代 2026-11-26「/oos 短链写死正式域名」
+# 的旧口径）：页面上展示的所有域名/接口地址都用用户打开面板时的地址
+# ——用哪个域名（或沙盒直达地址）打开，页面里的端点、接入地址、curl
+# 示例、分享短链就拼哪个。Handler 在每个请求开头把 Host 记进线程局部，
+# 页面函数用 display_base() 取；没有请求上下文（脚本/测试直调页面
+# 函数）或 Host 形状非法时回落正式域名。本站入站不做任何 Host 校验，
+# 任何 Host 都正常服务（多域名可用性靠相对跳转 + host-only Cookie）。
+_req_ctx = threading.local()
+DISPLAY_BASE_FALLBACK = "https://koi.ipv64.de"
+_HOST_OK = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9.\-]*[A-Za-z0-9])?(:\d{1,5})?$"
+    r"|^\[[0-9A-Fa-f:]+\](:\d{1,5})?$")
+
+
+def set_display_host(host) -> None:
+    """记录当前请求的 Host（Handler 在 do_* 开头调用）；非法/缺失则
+    清空，display_base() 走回落。只影响页面展示，不做放行判断。"""
+    host = (host or "").strip()
+    _req_ctx.host = host if _HOST_OK.match(host) else None
+
+
+def display_base() -> str:
+    """页面展示用的本站基地址：https://<当前请求 Host>；无上下文回落
+    正式域名。"""
+    host = getattr(_req_ctx, "host", None)
+    return f"https://{host}" if host else DISPLAY_BASE_FALLBACK
+
+
 def page(title: str, body: str, msg: str = "", is_err: bool = False) -> bytes:
     m = f'<div class="msg{" err" if is_err else ""}">{esc(msg)}</div>' if msg else ""
     doc = (f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
@@ -840,10 +870,11 @@ def _gw_info_html() -> str:
     """设置页 API 网关卡下方的参考区：完整端点 + 与官方目录同源的模型表。
     数据与 /v1/models 同一次 /v3/config 获取、同一缓存；目录拉不到时
     只显示一句话，不拿静态兜底表冒充实时数据。数值均为目录原值。"""
+    base = display_base()
     ep = ("<p class='small'>完整端点（客户端 Base URL 填第一个）：</p>"
-          "<p><code>https://koi.ipv64.de/v1</code></p>"
-          "<p><code>GET https://koi.ipv64.de/v1/models</code></p>"
-          "<p><code>POST https://koi.ipv64.de/v1/chat/completions</code></p>")
+          f"<p><code>{base}/v1</code></p>"
+          f"<p><code>GET {base}/v1/models</code></p>"
+          f"<p><code>POST {base}/v1/chat/completions</code></p>")
     rows = None
     try:
         rows = gateway.catalog_display(AccountStore())
@@ -981,7 +1012,7 @@ def fleet_page() -> bytes:
         return page("设备接入", "<h1>设备接入</h1>"
                                 "<div class='card'>设备接入模块未加载</div>"
                                 "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
-    base = "https://koi.ipv64.de"
+    base = display_base()
     head = f"""<h1>设备接入</h1>
 <div class="card"><h2>接入说明</h2>
 <p class="small">第三方设备用下面的接入密钥调用两个接口（请求头
@@ -1422,9 +1453,10 @@ def oos_link_page(key: str) -> bytes:
     if not key:
         return page("分享链接", "<h1>分享链接</h1><div class='card'>不可用</div>")
     code = oos_short_code(key)
-    # 域名写死正式入口：他有时从沙盒直达地址打开面板，用 Host 头拼链接会拼出
-    # se-sto11.tryaltare.ai:端口 这种外部打不开的地址。
-    url = f"https://koi.ipv64.de/oos/s/{code}"
+    # 域名以浏览器地址栏为准（2026-11-27 新规矩，取代 11-26 的写死正式
+    # 域名口径）：短链映射只存 code，展示/复制时按当前请求 Host 拼；
+    # 短链本身在任何域名下都是就地解析出内容，不跳回正式域名。
+    url = f"{display_base()}/oos/s/{code}"
     body = f"""<h1>分享链接（7 天有效）</h1>
 <p><a class="btn gray" href="/oos">返回对象存储</a></p>
 <div class="card"><p>文件：<b>{esc(key)}</b></p>
@@ -1923,6 +1955,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         """短链的 HEAD 探测（播放器开播前常先发）：只回头、不回体。"""
+        set_display_host(self.headers.get("Host"))
         u = urllib.parse.urlparse(self.path)
         if u.path in FAVICONS:
             return self._serve_favicon(u.path, head_only=True)
@@ -1951,6 +1984,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 路由 --
     def do_GET(self):
+        set_display_host(self.headers.get("Host"))
         u = urllib.parse.urlparse(self.path)
         if u.path == "/v1/models":
             return self._v1_models()
@@ -2028,6 +2062,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, page("404", "<h1>页面不存在</h1>"))
 
     def do_POST(self):
+        set_display_host(self.headers.get("Host"))
         u = urllib.parse.urlparse(self.path)
         if u.path == "/v1/chat/completions":
             return self._v1_chat()
