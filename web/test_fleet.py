@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -208,7 +209,7 @@ devs = {x["imei"]: x for x in fleet.list_devices()}
 check("心跳 type 入库", devs[IMEI].get("type") == "手机",
       str(devs[IMEI].get("type")))
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
-check("设备表有类型/备注列", ">类型</a>" in htmltxt
+check("设备表有类型/备注列", ">类型<span class='sarr'>" in htmltxt
       and "<th>备注</th>" in htmltxt)
 check("类型值渲染", "<td>手机</td>" in htmltxt)
 
@@ -392,7 +393,7 @@ devs = {x["imei"]: x for x in fleet.list_devices()}
 check("在线时长人话显示", devs[IMEI2].get("online_duration") == "2小时15分",
       str(devs[IMEI2].get("online_duration")))
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
-check("设备表有在线时长列", ">在线时长</a>" in htmltxt)
+check("设备表有在线时长列", ">在线时长<span class='sarr'>" in htmltxt)
 check("页面渲染在线时长", "2小时15分" in htmltxt)
 
 # ---------- 短信双时间列（上传时间 / 短信时间） ----------
@@ -409,8 +410,8 @@ dev_s = fleet.fmt_ts(rec["device_ts"]) if rec else ""
 check("上传/短信时间确实不同", bool(rec) and up_s != dev_s,
       f"{up_s} vs {dev_s}")
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
-check("短信表有双时间列头", ">上传时间 ▼</a>" in htmltxt
-      and ">短信时间</a>" in htmltxt)
+check("短信表有双时间列头", ">上传时间<span class='sarr'>" in htmltxt
+      and ">短信时间<span class='sarr'>" in htmltxt)
 pos = htmltxt.find("双时间列校验短信")
 seg = htmltxt[max(0, pos - 800):pos] if pos >= 0 else ""
 check("行内上传时间在前、短信时间在后",
@@ -502,35 +503,90 @@ check("短信按设备升序",
       == ["排序短信甲", "排序短信乙", "排序短信丙"],
       str(sms_order("device", "asc")))
 
+def th_cell(html, label):
+    """取某个可排序表头的 <th> 片段（列名 + 箭头对），找不到回空串。"""
+    i = html.find(f">{label}<span class='sarr'>")
+    if i < 0:
+        return ""
+    j = html.find("</th>", i)
+    return html[i:j] if j > i else ""
+
+
+def th_hrefs(cell):
+    return re.findall(r"href='([^']*)'", cell)
+
+
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})
-check("默认设备表头最后心跳带 ▼", ">最后心跳 ▼</a>" in htmltxt)
-check("可排序表头是链接", "dsort=phone" in htmltxt
-      and "ssort=sender" in htmltxt)
+# 每个可排序表头都常驻 ▲▼ 一对可点箭头；列名是纯文字、不被链接包裹
+for _lbl in ("手机号", "类型", "状态", "在线时长", "最后心跳",
+             "上传时间", "短信时间", "设备", "发送方"):
+    _cell = th_cell(htmltxt, _lbl)
+    check(f"表头 {_lbl} 常驻一对箭头",
+          _cell.count(">▲</a>") == 1 and _cell.count(">▼</a>") == 1
+          and len(th_hrefs(_cell)) == 2, _cell)
+    check(f"表头 {_lbl} 列名不在链接里",
+          f">{_lbl}</a>" not in htmltxt
+          and re.findall(r"<a [^>]*>([^<]*)</a>", _cell) == ["▲", "▼"],
+          _cell)
+# 不可排序列保持纯文字、无箭头
+check("不可排序列无箭头", "<th>备注</th>" in htmltxt
+      and "<th>内容</th>" in htmltxt)
+# 默认排序：最后心跳降序 → ▼ 高亮、▲ 不高亮；非当前列都不高亮
+_cell = th_cell(htmltxt, "最后心跳")
+check("默认最后心跳 ▼ 高亮、▲ 不高亮",
+      "class='on' title='降序'>▼</a>" in _cell
+      and "class='on' title='升序'>▲</a>" not in _cell, _cell)
+check("默认上传时间 ▼ 高亮",
+      "class='on' title='降序'>▼</a>" in th_cell(htmltxt, "上传时间"))
+check("非当前列箭头都不高亮",
+      "class='on'" not in th_cell(htmltxt, "类型")
+      and "class='on'" not in th_cell(htmltxt, "发送方"))
+# 箭头 href 分别指向升/降序（参数口径与上一轮一致）
+_hrefs = th_hrefs(th_cell(htmltxt, "手机号"))
+check("手机号 ▲/▼ 箭头分别指向升/降序",
+      any("dsort=phone" in h and "dorder=asc" in h for h in _hrefs)
+      and any("dsort=phone" in h and "dorder=asc" not in h
+              for h in _hrefs), str(_hrefs))
+_hrefs = th_hrefs(th_cell(htmltxt, "发送方"))
+check("发送方 ▲/▼ 箭头分别指向升/降序",
+      any("ssort=sender" in h and "sorder=asc" in h for h in _hrefs)
+      and any("ssort=sender" in h and "sorder=asc" not in h
+              for h in _hrefs), str(_hrefs))
 st, _, htmltxt = req("GET", "/fleet?dsort=phone&dorder=asc",
                      headers={"Cookie": sess})
-check("手机号当前列带 ▲", ">手机号 ▲</a>" in htmltxt)
-_i = htmltxt.find(">手机号 ▲</a>")
-_href_seg = htmltxt[max(0, _i - 80):_i] if _i >= 0 else ""
-check("点当前列切换为降序（链接不再带升序）",
-      "dsort=phone" in _href_seg and "dorder=asc" not in _href_seg,
-      _href_seg)
+_cell = th_cell(htmltxt, "手机号")
+check("手机号升序时 ▲ 高亮、▼ 不高亮",
+      "class='on' title='升序'>▲</a>" in _cell
+      and "class='on' title='降序'>▼</a>" not in _cell, _cell)
 check("页面按手机号升序排列",
       htmltxt.find("13711111111") < htmltxt.find("13722222222")
       < htmltxt.find("13733333333"))
+st, _, htmltxt = req("GET", "/fleet?dsort=phone&dorder=desc",
+                     headers={"Cookie": sess})
+check("手机号降序时 ▼ 高亮",
+      "class='on' title='降序'>▼</a>" in th_cell(htmltxt, "手机号"))
+check("页面按手机号降序排列",
+      htmltxt.find("13733333333") < htmltxt.find("13722222222")
+      < htmltxt.find("13711111111"))
 st, _, htmltxt = req("GET", "/fleet?dsort=phone&dorder=asc&dpage=2",
                      headers={"Cookie": sess})
-check("翻页后排序保持", ">手机号 ▲</a>" in htmltxt
+check("翻页后箭头与高亮保持",
+      "class='on' title='升序'>▲</a>" in th_cell(htmltxt, "手机号")
+      and th_cell(htmltxt, "手机号").count(">▼</a>") == 1
       and "dsort=phone" in htmltxt)
 st, _, htmltxt = req("GET", "/fleet?ssort=sender&sorder=asc&sq="
                      + urllib.parse.quote("排序短信"),
                      headers={"Cookie": sess})
-check("发送方当前列带 ▲", ">发送方 ▲</a>" in htmltxt)
+check("发送方升序时 ▲ 高亮",
+      "class='on' title='升序'>▲</a>" in th_cell(htmltxt, "发送方"))
 check("筛选下按发送方升序排列",
       htmltxt.find("排序短信乙") < htmltxt.find("排序短信甲")
       < htmltxt.find("排序短信丙"))
 st, _, htmltxt = req("GET", "/fleet?ssort=sender&sorder=asc&spage=2",
                      headers={"Cookie": sess})
-check("短信翻页后排序保持", ">发送方 ▲</a>" in htmltxt)
+check("短信翻页后箭头与高亮保持",
+      "class='on' title='升序'>▲</a>" in th_cell(htmltxt, "发送方")
+      and th_cell(htmltxt, "发送方").count(">▲</a>") == 1)
 
 # ---------- 改接入密钥：自定义 ----------
 st, _, htmltxt = req("GET", "/fleet", headers={"Cookie": sess})

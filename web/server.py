@@ -371,6 +371,11 @@ padding:9px 12px;margin:10px 0;font-size:14px}
 pre{background:#111827;color:#d1d5db;border-radius:8px;padding:10px;overflow:auto;
 font-size:12px;max-height:420px;white-space:pre-wrap;word-break:break-all}
 .small{color:#6b7280;font-size:12px}
+.sarr{white-space:nowrap;font-size:10px;margin-left:4px;vertical-align:2px}
+.sarr a{color:#bcc2cc;text-decoration:none;padding:0 1px}
+.sarr a:visited{color:#bcc2cc}
+.sarr a.on{color:#2563eb;font-weight:700}
+.sarr a.on:visited{color:#2563eb}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 form.inline{display:inline}
 .acts{display:grid;grid-template-columns:repeat(3,74px);gap:6px}
@@ -1082,17 +1087,18 @@ def _fleet_qs(dpage: int = 1, spage: int = 1, sdev: str = "",
 
 def _fleet_th(label: str, key, cur_sort: str, cur_order: str,
               href_of) -> str:
-    """可排序表头：可排序列渲染成链接，当前排序列带 ▲（升序）/
-    ▼（降序）；点当前列切换方向，点新列默认降序。key=None 不可排序。"""
+    """可排序表头：列名是普通表头文字（不带链接、不可点），每个可
+    排序列常驻一对小箭头 ▲▼——点 ▲ 该列升序、点 ▼ 该列降序；箭头
+    默认弱化灰，当前生效方向的那个带 on 类高亮（主题色加粗）。
+    key=None 不可排序，只出列名。"""
     if key is None:
         return f"<th>{esc(label)}</th>"
-    if key == cur_sort:
-        arrow = " ▲" if cur_order == "asc" else " ▼"
-        nxt = "asc" if cur_order == "desc" else "desc"
-    else:
-        arrow, nxt = "", "desc"
-    return (f"<th><a href='{href_of(key, nxt)}'>"
-            f"{esc(label)}{arrow}</a></th>")
+    up_on = " class='on'" if key == cur_sort and cur_order == "asc" else ""
+    dn_on = " class='on'" if key == cur_sort and cur_order == "desc" else ""
+    return (f"<th>{esc(label)}<span class='sarr'>"
+            f"<a href='{href_of(key, 'asc')}'{up_on} title='升序'>▲</a>"
+            f"<a href='{href_of(key, 'desc')}'{dn_on} title='降序'>▼</a>"
+            f"</span></th>")
 
 
 def _fleet_pager(cur: int, pages: int, total: int, unit: str,
@@ -1115,8 +1121,9 @@ def fleet_page(dpage: int = 1, spage: int = 1, sdev: str = "",
     短信表，每 30 秒自动刷新（刷新当前 URL，保留全部查询参数）。
     接入密钥可在本页自定义设置或随机更换（换后旧密钥立即失效）；
     设备可编辑手机号/类型/备注，在线设备显示在线时长；设备表、短信表
-    各自服务端分页（dpage/spage 互不影响）；两表表头可点排序（服务端
-    排序 dsort/dorder、ssort/sorder，当前列带 ▲/▼，与分页/筛选共存）；
+    各自服务端分页（dpage/spage 互不影响）；两表可排序列的表头各
+    常驻一对 ▲▼ 小箭头点排序（列名本身不可点；服务端排序
+    dsort/dorder、ssort/sorder，当前方向箭头高亮，与分页/筛选共存）；
     短信只保留 1 小时、可筛选/复制/删除，时间分上传时间（服务器收到）
     与短信时间（设备上报）两列。
     在线判定：最后心跳在 3 分钟内且最近一次上报 online=true
