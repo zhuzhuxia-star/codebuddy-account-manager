@@ -198,5 +198,38 @@ check("模型表带 id", 'id="gw-models"' in html)
 check("数值单元格带 data-v 排序键", 'data-v="300000"' in html
       and 'data-v="0.08"' in html)
 
+# ---------- 6. 模型列显示名（软件界面名） ----------
+print("[6] 模型列显示名")
+reset_cache()
+rows = gateway.catalog_display(store)
+by_id = {r["id"]: r for r in rows or []}
+g = by_id.get("glm-5.3-flash") or {}
+check("glm-5.3-flash 显示名 = GLM-5.3-Flash",
+      g.get("display_name") == "GLM-5.3-Flash", str(g.get("display_name")))
+hf = by_id.get("hy4flash-free") or {}
+check("hy4flash-free 显示名 = Hy4 flash",
+      hf.get("display_name") == "Hy4 flash", str(hf.get("display_name")))
+qa = by_id.get("quick-answer") or {}
+check("quick-answer 显示名与 id 相同",
+      qa.get("display_name") == "quick-answer", str(qa.get("display_name")))
+check("模型列排序键 = 显示名小写",
+      g.get("name_sort") == "glm-5.3-flash"
+      and hf.get("name_sort") == "hy4 flash",
+      f"{g.get('name_sort')} / {hf.get('name_sort')}")
+check("显示名与样本 name 逐字一致（全量）",
+      all(r["display_name"] == str(sample_by_id[r["id"]].get("name") or r["id"])
+          for r in rows or []))
+
+reset_cache()
+html = server.settings_page().decode("utf-8")
+check("页面主显示为软件显示名", "GLM-5.3-Flash" in html and "Hy4 flash" in html)
+glm_row = next((seg for seg in html.split("<tr>") if "GLM-5.3-Flash" in seg), "")
+check("glm 行同行弱化跟随调用名 id", "glm-5.3-flash" in glm_row)
+check("模型列单元格排序键 = 显示名小写", 'data-v="hy4 flash"' in html)
+qa_row = next((seg for seg in html.split("<tr>")
+               if 'data-v="quick-answer"' in seg), "")
+check("quick-answer 行名=id 只显示一个（不跟随重复 id）",
+      qa_row != "" and "（<code>quick-answer</code>）" not in qa_row)
+
 print(f"\nPASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

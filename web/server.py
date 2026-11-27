@@ -858,8 +858,12 @@ def _gw_info_html() -> str:
         mv = r.get("max_output")
         kv = r.get("credits_num")
         tv = r.get("reasoning_rank")
+        disp = r.get("display_name") or r["id"]
+        id_sub = (f" <span class='small'>（<code>{esc(r['id'])}</code>）</span>"
+                  if disp != r["id"] else "")
         trs.append(
-            f"<tr><td data-v=\"{esc(r['id'])}\"><code>{esc(r['id'])}</code>{tag}</td>"
+            f"<tr><td data-v=\"{esc(r.get('name_sort') or disp.lower())}\">"
+            f"{esc(disp)}{id_sub}{tag}</td>"
             f"<td data-v=\"{'' if cv is None else cv}\">{ctx}</td>"
             f"<td data-v=\"{'' if mv is None else mv}\">{out}</td>"
             f"<td data-v=\"{'' if kv is None else kv}\">{cred}</td>"

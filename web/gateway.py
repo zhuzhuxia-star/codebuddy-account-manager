@@ -1086,8 +1086,10 @@ def _display_context(m: dict) -> str | None:
 def catalog_display(store) -> list[dict] | None:
     """设置页参考区的模型行：与 /v1/models 同源（同一次 /v3/config 获取、
     同一缓存 _models_cache）。拉不到实时目录返回 None——展示区不拿
-    静态兜底表冒充实时数据。每行 {id, context, max_output, credits, tags}，
-    数值均为官方目录原值，不换算、不取整。"""
+    静态兜底表冒充实时数据。每行 {id, display_name, name_sort, context,
+    max_output, credits, tags}，数值均为官方目录原值，不换算、不取整。
+    display_name = 目录条目 name 原值（软件界面显示名，缺失时回落 id）；
+    name_sort = display_name 小写，作模型列排序键。"""
     def _fresh_raw():
         with _models_lock:
             raw = _models_cache.get("raw")
@@ -1106,8 +1108,11 @@ def catalog_display(store) -> list[dict] | None:
     for m in raw:
         if not m.get("id"):
             continue
+        disp = str(m.get("name") or m["id"])
         rows.append({
             "id": str(m["id"]),
+            "display_name": disp,
+            "name_sort": disp.lower(),
             "context": _display_context(m),
             "context_num": _context_num(m),
             "max_output": m.get("maxOutputTokens"),
