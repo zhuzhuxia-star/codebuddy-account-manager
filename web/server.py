@@ -45,6 +45,11 @@ try:
     import gateway  # noqa: E402  API 网关（/v1 端点）；缺失/损坏不影响主服务
 except Exception:  # noqa: BLE001
     gateway = None  # type: ignore
+
+try:
+    import fleet  # noqa: E402  第三方设备接入（/api/v1 + /fleet 页）；缺失/损坏不影响主服务
+except Exception:  # noqa: BLE001
+    fleet = None  # type: ignore
 from account_store import AccountStore, parse_pasted_text, quota_columns  # noqa: E402
 
 try:
@@ -746,6 +751,7 @@ def dashboard(msg: str = "", is_err: bool = False) -> bytes:
 <a class="btn gray" href="/settings">设置</a>
 <a class="btn gray" href="/logs">日志</a>
 <a class="btn gray" href="/oos">对象存储</a>
+<a class="btn gray" href="/fleet">设备接入</a>
 <form class="inline" method="post" action="/logout"><button class="gray">退出</button></form>
 </div>
 <div class="card small">共 {len(accounts)} 个账号 · 网关 {esc(conf.get('endpoint') or '默认')}
@@ -965,6 +971,96 @@ async function gwCopy() {{
 {gw_html}
 <p><a class="btn gray" href="/">返回账号列表</a></p>"""
     return page("设置", body, msg, is_err)
+
+
+def fleet_page() -> bytes:
+    """第三方设备接入展示页：接入说明（地址+密钥+curl 示例）+ 设备表 +
+    短信表，每 30 秒自动刷新。在线判定：最后心跳在 3 分钟内且最近一次
+    上报 online=true（fleet.list_devices 已算好 online_now）。"""
+    if fleet is None:
+        return page("设备接入", "<h1>设备接入</h1>"
+                                "<div class='card'>设备接入模块未加载</div>"
+                                "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
+    base = "https://koi.ipv64.de"
+    head = f"""<h1>设备接入</h1>
+<div class="card"><h2>接入说明</h2>
+<p class="small">第三方设备用下面的接入密钥调用两个接口（请求头
+<code>X-Device-Key</code>，或 <code>Authorization: Bearer</code>），
+IMEI 即设备身份。页面每 30 秒自动刷新。</p>
+<p>心跳：<code>POST {base}/api/v1/heartbeat</code></p>
+<p>短信上报：<code>POST {base}/api/v1/sms</code></p>
+<label>接入密钥（掩码）</label>
+<input value="{esc(fleet.key_masked())}" readonly>
+<label>接入密钥（明文，仅本管理页可见，别外传）</label>
+<textarea id="fleetkey" rows="2" readonly>{esc(fleet.key_plain())}</textarea>
+<button type="button" onclick="fleetCopy()">复制密钥</button>
+<p class="small">curl 示例（把 &lt;接入密钥&gt; 换成上面的密钥）：</p>
+<pre>curl -X POST {base}/api/v1/heartbeat \\
+  -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
+  -d '{{"imei":"860000000000001","phone":"13800000000","online":true,"model":"Pixel 8","battery":85}}'
+
+curl -X POST {base}/api/v1/sms \\
+  -H "X-Device-Key: &lt;接入密钥&gt;" -H "Content-Type: application/json" \\
+  -d '{{"imei":"860000000000001","from":"10086","content":"短信内容","ts":1764000000000}}'</pre>
+</div>
+<script>
+async function fleetCopy() {{
+  const t = document.getElementById('fleetkey');
+  try {{ await navigator.clipboard.writeText(t.value); alert('已复制'); }}
+  catch (e) {{ t.select(); document.execCommand('copy'); alert('已复制'); }}
+}}
+</script>"""
+    try:
+        devices = fleet.list_devices()
+    except Exception:  # noqa: BLE001
+        devices = []
+    dtrs = []
+    for d in devices:
+        status = ("<span style='color:#059669'>● 在线</span>" if d["online_now"]
+                  else "<span style='color:#9ca3af'>● 离线</span>")
+        bat = d.get("battery")
+        if bat is None or bat == "":
+            bat_s = "—"
+        else:
+            try:
+                bat_s = f"{float(bat):g}%"
+            except (TypeError, ValueError):
+                bat_s = esc(bat)
+        dtrs.append(
+            f"<tr><td><code>{esc(d['imei'])}</code></td>"
+            f"<td>{esc(d.get('phone') or '—')}</td><td>{status}</td>"
+            f"<td>{esc(fleet.fmt_ts(d.get('last_seen')))}</td>"
+            f"<td>{esc(d.get('model') or '—')}</td><td>{bat_s}</td></tr>")
+    dev_html = ("<div class='card'><h2>设备</h2><table>"
+                "<tr><th>IMEI</th><th>手机号</th><th>状态</th>"
+                "<th>最后心跳</th><th>型号</th><th>电量</th></tr>" +
+                ("".join(dtrs) if dtrs
+                 else "<tr><td colspan='6' class='small'>暂无设备</td></tr>") +
+                "</table></div>")
+    try:
+        msgs = fleet.list_sms(200)
+    except Exception:  # noqa: BLE001
+        msgs = []
+    strs_ = []
+    for m in msgs:
+        dev = m.get("phone") or m["imei"]
+        strs_.append(
+            f"<tr><td style='white-space:nowrap'>"
+            f"{esc(fleet.fmt_ts(m.get('received_at')))}</td>"
+            f"<td>{esc(dev)}</td><td>{esc(m.get('sender') or '—')}</td>"
+            f"<td style='word-break:break-all'>{esc(m.get('content') or '')}"
+            f"</td></tr>")
+    sms_html = ("<div class='card'><h2>短信（最新在前，最多 200 条）</h2>"
+                "<table><tr><th>时间</th><th>设备</th><th>发送方</th>"
+                "<th>内容</th></tr>" +
+                ("".join(strs_) if strs_
+                 else "<tr><td colspan='4' class='small'>暂无短信</td></tr>") +
+                "</table></div>")
+    body = (head + dev_html + sms_html +
+            "<p><a class='btn gray' href='/'>返回账号列表</a></p>")
+    doc = page("设备接入", body)
+    return doc.replace(b"<title>",
+                        b"<meta http-equiv='refresh' content='30'><title>", 1)
 
 
 def logs_page() -> bytes:
@@ -1697,6 +1793,33 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._send_json(outcome.status, outcome.payload)
 
+    # -- 第三方设备接入（/api/v1，接入密钥鉴权，不走网页登录态） --
+    def _fleet_api(self, kind: str):
+        if fleet is None:
+            return self._send_json(503, {"ok": False,
+                                         "error": "设备接入模块未加载"})
+        if not fleet.check_key(self.headers.get("X-Device-Key") or "",
+                               self.headers.get("Authorization") or ""):
+            return self._send_json(401, {"ok": False, "error": "接入密钥无效"},
+                                   {"WWW-Authenticate": "Bearer"})
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n > 0 else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("not an object")
+        except Exception:
+            return self._send_json(400, {"ok": False,
+                                         "error": "请求体不是合法 JSON"})
+        try:
+            if kind == "heartbeat":
+                code, obj = fleet.heartbeat(body)
+            else:
+                code, obj = fleet.record_sms(body)
+        except Exception as e:  # noqa: BLE001
+            return self._send_json(500, {"ok": False, "error": f"内部错误：{e}"})
+        return self._send_json(code, obj)
+
     def _cookie_token(self) -> str | None:
         for part in (self.headers.get("Cookie") or "").split(";"):
             part = part.strip()
@@ -1867,6 +1990,8 @@ class Handler(BaseHTTPRequestHandler):
                                                q.get("source", "")))
         if u.path == "/oos":
             return self._send(200, oos_page(msg, is_err))
+        if u.path == "/fleet":
+            return self._send(200, fleet_page())
         if u.path == "/oos/get":
             key = q.get("key", "")
             if not key:
@@ -1910,6 +2035,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._v1_messages()
         if u.path == "/v1/responses":
             return self._v1_responses()
+        if u.path == "/api/v1/heartbeat":
+            return self._fleet_api("heartbeat")
+        if u.path == "/api/v1/sms":
+            return self._fleet_api("sms")
         if u.path == "/oos/upload":
             return self._oos_upload()
         form = self._form()
@@ -2061,6 +2190,11 @@ def main():
     if gateway is not None:
         try:
             gateway.ensure_key()
+        except Exception:  # noqa: BLE001
+            pass
+    if fleet is not None:
+        try:
+            fleet.ensure_key()
         except Exception:  # noqa: BLE001
             pass
     if load_conf().get("setup_token"):
